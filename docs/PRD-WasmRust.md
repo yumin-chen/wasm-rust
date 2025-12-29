@@ -8,9 +8,6 @@ Type: Product Requirements Document
 # WasmRust
 
 ## Introduction
-# Requirements Document
-
-## Introduction
 
 This document specifies the requirements for WasmRust, an optimized Rust-to-WebAssembly compilation system that addresses the current limitations of the standard Rust WASM toolchain. The system aims to provide minimal binary sizes, fast compilation times, seamless Component Model integration, and zero-overhead JavaScript interoperability while maintaining Rust's memory safety guarantees.
 
