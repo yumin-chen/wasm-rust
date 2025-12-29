@@ -1,0 +1,30 @@
+[package]
+name = "wasmrust-codegen-cranelift"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "WASM-tuned Cranelift backend for WasmRust compiler"
+
+[lib]
+crate-type = ["rlib"]
+path = "lib.rs"
+
+[dependencies]
+wasm = { path = "../../../crates/wasm" }
+# rustc_codegen_cranelift = "0.99.0"  # Placeholder - version doesn't exist yet
+# cranelift-codegen-meta = "0.99.0"     # Placeholder - version doesn't exist yet
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+# Browser-specific optimizations
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "wasi"))'.dependencies]
+# WASI-specific dependencies
+
+[features]
+default = ["dev-build"]
+dev-build = []
+release-build = ["pgo"]
+pgo = []
+
+[lints.rust]
+unexpected_cfgs = "forbid"

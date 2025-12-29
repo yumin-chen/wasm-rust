@@ -1,0 +1,46 @@
+# WasmRust Project Structure Contract
+# This file defines the canonical structure that CI and tooling must enforce
+
+[root]
+required = [
+  "crates",
+  "src", 
+  "docs",
+  "tests",
+  "README.md",
+]
+
+[directories.crates]
+required = ["wasm"]
+
+[directories.src]
+required = [
+  "lib.rs",
+  "backend",
+  "wasmir",
+]
+
+[directories.src.backend]
+required = [
+  "cranelift",
+  "llvm",
+]
+
+[directories.docs]
+required = [
+  "SAFETY.md",
+  "compiler-contract.md",
+]
+
+[constraints.forbid_paths]
+# No crate may depend on compiler internals
+{ from = "crates/**", to = "src/**" }
+
+[constraints.required_workspace_members]
+required = [
+  "crates/wasm",
+]
+
+[validation.property_tests]
+test_crate = "structure_tests"
+main_test = "prop_project_structure_consistency"

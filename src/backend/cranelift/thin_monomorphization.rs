@@ -6,16 +6,13 @@
 //! tools for code attribution.
 
 use crate::wasmir::{
-    WasmIR, Signature, Type, Instruction, Terminator, Operand, 
-    BinaryOp, UnaryOp, BasicBlock, BlockId, Constant,
+    WasmIR, Signature, Type, Instruction, Terminator, BasicBlock, BlockId, Constant,
     Capability, OwnershipAnnotation, SourceLocation,
 };
 use rustc_middle::ty::{self, TyS, TyKind, Instance};
 use rustc_middle::mir::{Body, BasicBlock, Terminator};
 use rustc_target::spec::Target;
 use std::collections::{HashMap, HashSet, BTreeMap};
-use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
 
 /// Thin monomorphization context for optimizing generic functions
 pub struct ThinMonomorphizationContext {
@@ -55,24 +52,17 @@ pub struct GenericFunction {
 /// Generic function signature with type parameters
 #[derive(Debug, Clone)]
 pub struct GenericSignature {
-    /// Function name
     name: String,
-    /// Generic parameters
     type_params: Vec<TypeParam>,
-    /// Function parameter types (may contain type parameters)
     param_types: Vec<GenericType>,
-    /// Return type (may contain type parameters)
     return_type: Option<GenericType>,
-    /// Source location for debugging
     source_location: SourceLocation,
 }
 
 /// Type parameter in generic function
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TypeParam {
-    /// Parameter identifier
     id: String,
-    /// Parameter constraints
     constraints: Vec<TypeConstraint>,
 }
 
@@ -173,7 +163,7 @@ pub struct StreamingLayout {
     pub relocations: Vec<RelocationInfo>,
 }
 
-/// Code segment for streaming layout
+/// Code segment for streaming
 #[derive(Debug, Clone)]
 pub struct CodeSegment {
     /// Segment identifier
@@ -308,7 +298,27 @@ impl ThinMonomorphizationContext {
         Ok(final_functions)
     }
 
-    /// Identifies generic functions in the WasmIR module
+    /// Sets optimization flags
+    pub fn set_optimization_flags(&mut self, flags: MonomorphizationFlags) {
+        self.optimization_flags = flags;
+    }
+
+    /// Gets code size statistics
+    pub fn get_size_stats(&self) -> &CodeSizeStats {
+        &self.size_stats
+    }
+
+    /// Gets streaming layout information
+    pub fn get_streaming_layout(&self) -> &StreamingLayout {
+        &self.streaming_layout
+    }
+
+    /// Resets optimization statistics
+    pub fn reset_stats(&mut self) {
+        self.size_stats = CodeSizeStats::default();
+    }
+
+    /// Identifies generic functions in WasmIR module
     fn identify_generic_functions(
         &mut self,
         wasmir_module: &[WasmIR],
@@ -638,7 +648,7 @@ impl ThinMonomorphizationContext {
 
     /// Optimizes a single function using thin monomorphization
     fn optimize_function(
-        &mut self,
+        &self,
         function: &WasmIR,
     ) -> Result<Option<WasmIR>, MonomorphizationError> {
         // Check if this function can be optimized
@@ -653,7 +663,7 @@ impl ThinMonomorphizationContext {
         let mut optimized_func = function.clone();
         optimized_func.basic_blocks = optimized_instructions;
         
-        self.size_stats.monomomorphizations_performed += 1;
+        self.size_stats.monomorphizations_performed += 1;
         Ok(Some(optimized_func))
     }
 
@@ -679,7 +689,7 @@ impl ThinMonomorphizationContext {
 
     /// Optimizes basic blocks with monomorphization
     fn optimize_instructions(
-        &mut self,
+        &self,
         basic_blocks: &[BasicBlock],
     ) -> Result<Vec<BasicBlock>, MonomorphizationError> {
         let mut optimized_blocks = Vec::new();
@@ -694,7 +704,7 @@ impl ThinMonomorphizationContext {
 
     /// Optimizes a single basic block
     fn optimize_basic_block(
-        &mut self,
+        &self,
         block: &BasicBlock,
     ) -> Result<BasicBlock, MonomorphizationError> {
         let mut optimized_instructions = Vec::new();
@@ -716,7 +726,7 @@ impl ThinMonomorphizationContext {
 
     /// Optimizes a single instruction
     fn optimize_instruction(
-        &mut self,
+        &self,
         instruction: &Instruction,
     ) -> Result<Option<Instruction>, MonomorphizationError> {
         match instruction {
@@ -728,17 +738,9 @@ impl ThinMonomorphizationContext {
                     Ok(None)
                 }
             }
-            Instruction::Call { func_ref, args } => {
+            Instruction::Call { args, .. } => {
                 // Apply function call optimizations
-                if let Some(optimized) = self.optimize_function_call(*func_ref, args)? {
-                    Ok(Some(optimized))
-                } else {
-                    Ok(None)
-                }
-            }
-            Instruction::MemoryLoad { address, ty, align, offset } => {
-                // Apply memory access optimizations
-                if let Some(optimized) = self.optimize_memory_load(address, ty, *align, *offset)? {
+                if let Some(optimized) = self.optimize_function_call(args)? {
                     Ok(Some(optimized))
                 } else {
                     Ok(None)
@@ -750,7 +752,7 @@ impl ThinMonomorphizationContext {
 
     /// Optimizes binary operations for WASM
     fn optimize_binary_operation(
-        &mut self,
+        &self,
         op: BinaryOp,
         left: &Operand,
         right: &Operand,
@@ -782,18 +784,19 @@ impl ThinMonomorphizationContext {
 
     /// Optimizes multiplication by power of 2
     fn optimize_multiply_by_power_of_two(
-        &mut self,
+        &self,
         left: &Operand,
         right: &Operand,
     ) -> Result<Option<Instruction>, MonomorphizationError> {
         // Check if right operand is a power of 2
-        if let Operand::Constant(wasmir::Constant::I32(const_val)) = right {
-            if const_val > 0 && const_val.is_power_of_two() {
-                // Replace multiplication with shift
-                let shift_amount = const_val.trailing_zeros();
+        if let (Operand::Constant(wasmir::Constant::I32(const_val)), 
+                Operand::Constant(wasmir::Constant::I32(multiplier))) = (left, right) {
+            if const_val > 0 && multiplier.is_power_of_two() {
+                // Replace multiplication by power_of_two with shift
+                let shift_amount = multiplier.trailing_zeros();
                 return Ok(Some(Instruction::BinaryOp {
                     op: BinaryOp::Shl,
-                    left: left.clone(),
+                    left: Operand::Constant(wasmir::Constant::I32(const_val)),
                     right: Operand::Constant(wasmir::Constant::I32(shift_amount)),
                 }));
             }
@@ -804,14 +807,14 @@ impl ThinMonomorphizationContext {
 
     /// Optimizes division by power of 2
     fn optimize_divide_by_power_of_two(
-        &mut self,
+        &self,
         left: &Operand,
         right: &Operand,
     ) -> Result<Option<Instruction>, MonomorphizationError> {
         // Check if right operand is a power of 2
         if let Operand::Constant(wasmir::Constant::I32(const_val)) = right {
             if const_val > 0 && const_val.is_power_of_two() {
-                // Replace division with shift (for unsigned division)
+                // Replace division by power_of_two with shift (for unsigned division)
                 let shift_amount = const_val.trailing_zeros();
                 return Ok(Some(Instruction::BinaryOp {
                     op: BinaryOp::Shr,
@@ -826,7 +829,7 @@ impl ThinMonomorphizationContext {
 
     /// Optimizes constant addition
     fn optimize_constant_addition(
-        &mut self,
+        &self,
         left: &Operand,
         right: &Operand,
     ) -> Result<Option<Instruction>, MonomorphizationError> {
@@ -848,93 +851,16 @@ impl ThinMonomorphizationContext {
 
     /// Optimizes function calls
     fn optimize_function_call(
-        &mut self,
-        func_ref: u32,
+        &self,
         args: &[Operand],
     ) -> Result<Option<Instruction>, MonomorphizationError> {
         // Check for inlining opportunities
-        if let Some(optimized) = self.consider_inlining(func_ref, args)? {
-            return Ok(Some(optimized));
-        }
-        
-        // Check for tail call optimization
-        if let Some(optimized) = self.consider_tail_call(func_ref, args)? {
-            return Ok(Some(optimized));
-        }
-        
-        Ok(None)
-    }
-
-    /// Considers function inlining
-    fn consider_inlining(
-        &mut self,
-        func_ref: u32,
-        args: &[Operand],
-    ) -> Result<Option<Instruction>, MonomorphizationError> {
-        // Check if the function is small enough to inline
-        // This is simplified - in practice, this would analyze the actual function
-        if self.is_small_function(func_ref) {
-            // Would inline the function here
+        if args.len() < 3 { // Small functions are inlining candidates
+            // Would inline here
             // For now, return None (don't inline)
         }
         
         Ok(None)
-    }
-
-    /// Considers tail call optimization
-    fn consider_tail_call(
-        &mut self,
-        func_ref: u32,
-        args: &[Operand],
-    ) -> Result<Option<Instruction>, MonomorphizationError> {
-        // Check if this is a tail call (function call as last operation)
-        // This is simplified - in practice, this would analyze the control flow
-        Ok(None)
-    }
-
-    /// Checks if a function is small enough for inlining
-    fn is_small_function(&self, func_ref: u32) -> bool {
-        // This is simplified - in practice, this would look up the function size
-        // For now, assume functions with ID < 10 are small
-        func_ref < 10
-    }
-
-    /// Optimizes memory load operations
-    fn optimize_memory_load(
-        &mut self,
-        address: &Operand,
-        ty: &Type,
-        align: Option<u32>,
-        offset: u32,
-    ) -> Result<Option<Instruction>, MonomorphizationError> {
-        // Optimize for common access patterns
-        if offset == 0 {
-            // Direct load is optimal
-            return Ok(None);
-        }
-        
-        // Consider alignment optimizations
-        if let Some(actual_align) = align {
-            if self.can_optimize_alignment(ty, actual_align) {
-                // Would optimize alignment here
-                return Ok(None);
-            }
-        }
-        
-        Ok(None)
-    }
-
-    /// Checks if alignment can be optimized
-    fn can_optimize_alignment(&self, ty: &Type, align: u32) -> bool {
-        // Check if alignment matches natural alignment of type
-        let natural_align = match ty {
-            Type::I32 | Type::F32 => 4,
-            Type::I64 | Type::F64 => 8,
-            Type::Ref(_) => 4, // Ref is 32-bit
-            _ => return false,
-        };
-        
-        align >= natural_align
     }
 
     /// Optimizes streaming layout for fast WASM instantiation
@@ -1151,26 +1077,6 @@ impl ThinMonomorphizationContext {
         
         Ok(functions.to_vec())
     }
-
-    /// Gets code size statistics
-    pub fn get_size_stats(&self) -> &CodeSizeStats {
-        &self.size_stats
-    }
-
-    /// Gets streaming layout information
-    pub fn get_streaming_layout(&self) -> &StreamingLayout {
-        &self.streaming_layout
-    }
-
-    /// Resets optimization statistics
-    pub fn reset_stats(&mut self) {
-        self.size_stats = CodeSizeStats::default();
-    }
-
-    /// Sets optimization flags
-    pub fn set_optimization_flags(&mut self, flags: MonomorphizationFlags) {
-        self.optimization_flags = flags;
-    }
 }
 
 /// Extension trait for checking if a number is a power of 2
@@ -1222,7 +1128,6 @@ mod tests {
             arch: "wasm32".to_string(),
             ..Default::default()
         };
-        
         let mut context = ThinMonomorphizationContext::new(target);
         
         // Create a generic function (simplified)
@@ -1250,4 +1155,64 @@ mod tests {
             ..Default::default()
         };
         
-        l
+        let mut context = ThinMonomorphizationContext::new(target);
+        
+        // Create a generic function (simplified)
+        let mut generic_func = wasmir::WasmIR::new(
+            "generic_function<T>".to_string(),
+            wasmir::Signature {
+                params: vec![wasmir::Type::Ref("T".to_string())],
+                returns: Some(wasmir::Type::Ref("T".to_string())),
+            },
+        );
+        
+        let wasmir_module = vec![generic_func.clone()];
+        
+        let result = context.analyze_and_optimize(&wasmir_module);
+        assert!(result.is_ok());
+        
+        assert!(context.get_size_stats().functions_optimized > 0);
+        assert!(context.get_size_stats().monomorphizations_performed > 0);
+    }
+
+    #[test]
+    fn test_streaming_optimization() {
+        let target = rustc_target::spec::Target {
+            arch: "wasm32".to_string(),
+            ..Default::default()
+        };
+        
+        let mut context = ThinMonomorphizationContext::new(target);
+        let flags = MonomorphizationFlags {
+            enable_streaming_layout: true,
+            ..Default::default()
+        };
+        context.set_optimization_flags(flags);
+        
+        // Create functions for testing
+        let core_func = wasmir::WasmIR::new(
+            "__wasmrust_init".to_string(),
+            wasmir::Signature {
+                params: vec![],
+                returns: Some(wasmir::Type::Void),
+            },
+        );
+        
+        let app_func = wasmir::WasmIR::new(
+            "application_function".to_string(),
+            wasmir::Signature {
+                params: vec![wasmir::Type::I32],
+                returns: Some(wasmir::Type::I32),
+            },
+        );
+        
+        let wasmir_module = vec![core_func.clone(), app_func.clone()];
+        
+        let result = context.analyze_and_optimize(&wasmir_module);
+        assert!(result.is_ok());
+        
+        let layout = context.get_streaming_layout();
+        assert!(!layout.function_order.is_empty());
+        assert!(!layout.code_segments.is_empty());
+    }
+}

@@ -1,6 +1,6 @@
 //! Property-based tests for WasmRust project structure consistency
 //! 
-//! This module validates that the WasmRust project follows the established
+//! This module validates that the WasmRust project follows established
 //! structural conventions and maintains consistency across all components.
 //! 
 //! Property 15: Project Structure Consistency
@@ -9,9 +9,12 @@
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 
+mod structure_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::structure_tests::validate_structure;
     use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
     use std::fs;
 

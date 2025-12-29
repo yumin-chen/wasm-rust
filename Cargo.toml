@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/wasm",
+  "src/backend/cranelift",
+  "src/backend/llvm",
+]
+
+[workspace.dependencies]
+# Workspace-level dependencies for testing
+quickcheck = "1.0"
+criterion = "0.5"
+proptest = "1.0"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
