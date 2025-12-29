@@ -1,11 +1,14 @@
 ---
 Status: Draft
-Version: 0.0.1.draft.1
+Version: 0.1.0
 Date: 2025-12-29
 Type: Product Requirements Document
 ---
 
 # WasmRust
+
+## Introduction
+# Requirements Document
 
 ## Introduction
 
@@ -22,6 +25,9 @@ This document specifies the requirements for WasmRust, an optimized Rust-to-WebA
 - **Cranelift**: Fast code generator used as alternative to LLVM
 - **PGO**: Profile-Guided Optimization using runtime profiling data
 - **SharedSlice**: Safe abstraction for shared memory access across WASM threads
+- **WasmGC**: WebAssembly Garbage Collection proposal for native GC support
+- **GcArray**: Garbage-collected array type for WasmGC environments
+- **GcString**: Garbage-collected string type for WasmGC environments
 
 ## Requirements
 
@@ -31,7 +37,7 @@ This document specifies the requirements for WasmRust, an optimized Rust-to-WebA
 
 #### Acceptance Criteria
 
-1. WHEN compiling a "hello world" program with freestanding profile, THE WasmRust_Compiler SHALL generate binaries under 15 KB (compared to current 35+ KB baseline)
+1. WHEN compiling a "hello world" program with freestanding profile, THE WasmRust_Compiler SHALL generate binaries under 2 KB (improved from 15 KB to match MoonBit performance)
 2. WHEN compiling applications with standard library features, THE WasmRust_Compiler SHALL generate binaries at most 3x larger than equivalent C programs compiled with similar feature sets
 3. WHEN using generic functions, THE WasmRust_Compiler SHALL apply thin monomorphization to reduce code duplication by at least 30% compared to current rustc
 4. WHEN dead code exists, THE WasmRust_Compiler SHALL eliminate unused functions and data through tree-shaking
@@ -43,7 +49,7 @@ This document specifies the requirements for WasmRust, an optimized Rust-to-WebA
 
 #### Acceptance Criteria
 
-1. WHEN compiling 10,000 lines of code in development mode, THE WasmRust_Compiler SHALL complete within 5 seconds
+1. WHEN compiling 10,000 lines of code in development mode, THE WasmRust_Compiler SHALL complete within 2 seconds (improved from 5 seconds to match MoonBit performance)
 2. WHEN using Cranelift backend, THE WasmRust_Compiler SHALL compile at least 5x faster than LLVM backend
 3. WHEN incremental compilation is enabled, THE WasmRust_Compiler SHALL recompile only changed modules
 4. THE WasmRust_Compiler SHALL provide separate development and release build profiles
@@ -181,6 +187,30 @@ This document specifies the requirements for WasmRust, an optimized Rust-to-WebA
 4. WHEN the wasm crate is replaced or removed, THE WasmRust_Compiler SHALL produce semantically equivalent output to stable rustc
 5. THE WasmRust_Compiler SHALL implement the wasm-recognition lint group to prevent unsound assumptions
 
+### Requirement 14: Dual-Mode Compilation System
+
+**User Story:** As a web developer, I want to choose between ownership-based and GC-based memory management for different parts of my application, so that I can optimize for performance or simplicity as needed.
+
+#### Acceptance Criteria
+
+1. THE WasmRust_Compiler SHALL support dual compilation modes: ownership mode (default) and GC mode via #[wasm::gc] attribute
+2. WHEN compiling in ownership mode, THE WasmRust_Compiler SHALL use Rust's standard ownership and borrowing semantics
+3. WHEN compiling with #[wasm::gc] attribute, THE WasmRust_Compiler SHALL generate WasmGC-compatible code using garbage collection
+4. THE WasmRust_Compiler SHALL allow mixing ownership and GC modes within the same codebase through explicit boundaries
+5. WHEN targeting WASM environments without GC support, THE WasmRust_Compiler SHALL provide polyfill implementations or compile-time errors
+
+### Requirement 15: GC-Native Type System
+
+**User Story:** As a developer targeting modern WASM runtimes, I want native garbage-collected types that integrate seamlessly with WasmGC, so that I can write simpler code without manual memory management.
+
+#### Acceptance Criteria
+
+1. THE WasmRust_Compiler SHALL provide GC-native types: GcArray<T>, GcString, GcBox<T>, and GcRef<T>
+2. WHEN using GC types, THE WasmRust_Compiler SHALL generate native WasmGC instructions without polyfills
+3. THE WasmRust_Compiler SHALL enforce GC type safety at compile time preventing mixing of GC and non-GC references
+4. WHEN interfacing between GC and ownership modes, THE WasmRust_Compiler SHALL require explicit conversion through safe APIs
+5. THE WasmRust_Runtime SHALL provide automatic memory management for GC types with deterministic collection in supported environments
+
 ## Non-Goals
 
 The following are explicitly outside the scope of WasmRust:
@@ -188,7 +218,7 @@ The following are explicitly outside the scope of WasmRust:
 - **Browser Runtime Replacement**: WasmRust will not replace or modify browser WASM engines
 - **Rust Language Fork**: Core Rust language semantics will not be changed; extensions will be library-based where possible, with minimal compiler extensions for WASM-specific features
 - **Universal Threading**: Full threading support in all environments; single-threaded fallbacks are acceptable and expected
-- **Garbage Collection**: WasmRust will not introduce garbage collection or automatic memory management beyond Rust's ownership system
+- **Universal Garbage Collection**: GC support is opt-in via #[wasm::gc] attribute; ownership mode remains the default
 - **Backward Compatibility**: Breaking changes from existing wasm-bindgen workflows are acceptable for significant improvements
 - **Universal Host Support**: Performance and capability guarantees apply only to explicitly supported host profiles
 
@@ -202,11 +232,11 @@ WasmRust SHALL support the following build profiles as contracts:
 - No allocator
 - Custom entry points only
 - Cranelift backend only
-- Target: <15 KB binaries
+- Target: <2 KB binaries (improved from 15 KB to match MoonBit)
 
 ### Development Profile  
 - Cranelift backend
-- Fast compilation (<5s for 10k LOC)
+- Fast compilation (<2s for 10k LOC, improved from 5s)
 - Debug symbols included
 - Incremental compilation enabled
 - Deterministic output for reproducibility
@@ -218,6 +248,12 @@ WasmRust SHALL support the following build profiles as contracts:
 - Reproducible builds with manifest hashing
 - Toolchain version embedding
 
+### GC Profile
+- WasmGC-native compilation mode
+- Garbage collection for marked types
+- Simplified memory management
+- Compatible with modern WASM runtimes
+
 ## Host Profile Support
 
 WasmRust explicitly supports the following execution environments:
@@ -227,6 +263,7 @@ WasmRust explicitly supports the following execution environments:
 - **JS Interop**: Direct calls with managed reference tables
 - **Component Model**: Partial support via polyfills
 - **Memory Regions**: Not supported
+- **WasmGC**: Native support in modern browsers
 - **Performance Target**: <100ns JS call overhead
 
 ### Node.js Profile  
@@ -234,6 +271,7 @@ WasmRust explicitly supports the following execution environments:
 - **JS Interop**: Native bindings
 - **Component Model**: Via polyfill
 - **Memory Regions**: Not supported
+- **WasmGC**: Via V8 engine support
 - **Performance Target**: <50ns JS call overhead
 
 ### Wasmtime Profile
@@ -241,6 +279,7 @@ WasmRust explicitly supports the following execution environments:
 - **JS Interop**: Host functions
 - **Component Model**: Full native support
 - **Memory Regions**: Configurable by host
+- **WasmGC**: Native support
 - **Performance Target**: <25ns host call overhead
 
 ### Embedded Profile
@@ -248,6 +287,7 @@ WasmRust explicitly supports the following execution environments:
 - **JS Interop**: Not supported  
 - **Component Model**: Partial (static linking only)
 - **Memory Regions**: Not supported
+- **WasmGC**: Not supported (ownership mode only)
 - **Performance Target**: Minimal runtime overhead
 
 ## Security and Trust Model
@@ -300,6 +340,7 @@ WasmRust explicitly supports the following execution environments:
 | Canonical ABI | ✅ JS impl | ✅ Native | ✅ Native | ⚠️ Subset |
 | Dynamic Linking | ❌ | ⚠️ Via loader | ✅ Native | ❌ |
 | Futures/Streams | ❌ | ❌ | ✅ Preview 2 | ❌ |
+| WasmGC Support | ✅ Native | ✅ Native | ✅ Native | ❌ |
 
 **Legend**: 
 - ✅ Full native support
@@ -344,6 +385,7 @@ WasmRust explicitly supports the following execution environments:
 
 3. **Timing Attacks on Cryptographic Code**
    - **Rationale**: Use constant-time crypto libraries (not compiler's job)
+
 ## Appendix D: Compiler-Crate Contract Specification
 
 ### Purpose
