@@ -72,6 +72,18 @@ graph TB
 
 **Migration Path**: If upstream Rust adopts conflicting features, WasmRust provides 6-month deprecation window and automatic migration tools.
 
+### Compiler-Crate Contract
+
+**Fundamental Principle**: The `wasm` crate defines meaning. The compiler may accelerate meaning—but never redefine it.
+
+The formal Compiler ↔ Crate Contract establishes:
+
+1. **Zero-Cost Invariant**: All public types are `#[repr(transparent)]` or `#[repr(C)]`, layout-compatible with WASM, free of hidden allocations
+2. **No Semantic Magic**: The `wasm` crate provides no behavior requiring compiler support
+3. **Escape Hatch Rule**: Everything the compiler assumes must be reproducible by pure library implementation
+
+**Verification**: The compiler implements the `wasm-recognition` lint group and `verify_wasm_invariants` MIR pass to mechanically verify all optimizations reference documented invariants and match only whitelisted MIR patterns.
+
 ### Host Profile Support
 
 WasmRust supports different execution environments with varying capabilities:
@@ -118,11 +130,13 @@ WasmIR serves as a stable boundary between frontend and backends, encoding:
 - **Guarantees**: Fast compilation, debuggable output, deterministic layout
 - **Responsibilities**: Instruction selection, basic register allocation, simple inlining
 - **Constraints**: No cross-module optimization, stable instruction ordering
+- **Contract Compliance**: Only optimizes whitelisted MIR patterns from Compiler ↔ Crate Contract
 
 **LLVM Backend (Release Profile)**:
 - **Guarantees**: Maximum optimization, PGO support, minimal binary size
 - **Responsibilities**: Aggressive optimization, whole-program analysis, size reduction
 - **Constraints**: Longer compilation time acceptable
+- **Contract Compliance**: All optimizations must reference documented invariants and pass verification
 
 ## Components and Interfaces
 
@@ -130,11 +144,11 @@ WasmIR serves as a stable boundary between frontend and backends, encoding:
 
 #### WASM Native Types
 
-The foundation provides abstractions for WebAssembly reference types with explicit runtime contracts:
+The foundation provides abstractions for WebAssembly reference types with explicit runtime contracts defined by the formal Compiler ↔ Crate Contract:
 
 ```rust
 // ExternRef: Managed reference to JavaScript objects
-// Note: Requires runtime indirection table for host compatibility
+// Contract: Maps 1:1 to WASM externref, opaque, non-dereferenceable
 #[repr(transparent)]
 pub struct ExternRef<T> {
     handle: u32, // Index into runtime reference table
@@ -152,34 +166,39 @@ impl<T> ExternRef<T> {
     // Method calls require host profile support
     pub fn call<Args, Ret>(&self, method: &str, args: Args) -> Result<Ret, InteropError>
     where T: js::HasMethod<Args, Ret> {
-        // Lowered to host-specific interop mechanism
+        // Compiler may optimize this to direct WASM externref calls
         unsafe { js::invoke_checked(self.handle, method, args) }
     }
 }
 
 // FuncRef: Managed function references
+// Contract: Maps to WASM funcref, opaque handle
 #[repr(transparent)]
 pub struct FuncRef {
     handle: u32, // Index into function table
 }
 
 // SharedSlice: Safe shared memory access with explicit constraints
-pub struct SharedSlice<'a, T: wasm::Pod> {
-    ptr: *const T,
+// Contract: T: Pod implies no pointers, no drop glue, bitwise movable
+pub struct SharedSlice<'a, T: Pod> {
+    ptr: NonNull<T>,
     len: usize,
     _marker: PhantomData<&'a [T]>,
 }
 
 // Pod trait: Types safe for zero-copy sharing
-pub unsafe trait Pod: Copy + Send + Sync {
+// Contract: Trivially copyable, no invalid bit patterns, no pointers
+pub unsafe trait Pod: Copy + Send + Sync + 'static {
     // Marker trait for types with no internal pointers
 }
 
 unsafe impl Pod for u8 {}
 unsafe impl Pod for i32 {}
 unsafe impl Pod for f64 {}
-// Complex types require explicit implementation
+// Complex types require explicit implementation with safety proof
 ```
+
+**Compiler Contract Enforcement**: The compiler may only assume documented invariants and optimize whitelisted MIR patterns as specified in the formal contract.
 ```
 
 #### Linear Types for Resource Management
@@ -357,6 +376,85 @@ Data collected includes:
 - Cold code paths for lazy loading
 - Memory access patterns for data layout optimization
 - Branch prediction data for control flow optimization
+
+## Compiler-Crate Contract
+
+### Contract Overview
+
+The formal Compiler ↔ Crate Contract prevents unsound optimizations and ecosystem lock-in by establishing explicit boundaries between the WasmRust compiler and the `wasm` crate.
+
+### Unsafe Invariants
+
+#### Type-Level Invariants
+
+**ExternRef<T>**:
+- **Opaque Handle**: `handle` is never interpreted as a pointer to linear memory
+- **Non-Aliasing**: Does not alias any Rust-accessible memory
+- **Drop Transparency**: Dropping has no observable Rust side effects
+- **Type Marker Only**: `T` is compile-time only, does not affect runtime behavior
+
+**SharedSlice<'a, T: Pod>**:
+- **Valid Memory Range**: Pointer + length remains valid for `'a`
+- **Pod Soundness**: `T` satisfies all Pod invariants (no pointers, no drop, bitwise movable)
+- **No Implicit Atomics**: Concurrent access requires explicit synchronization
+- **Standard Slice Aliasing**: Rust aliasing rules apply without relaxation
+
+**Pod Trait**:
+- **Bit Validity**: Every possible bit pattern is valid
+- **Move Transparency**: Bitwise move preserves meaning
+- **No Hidden Semantics**: No drop glue, interior pointers, or provenance tracking
+
+### MIR Pattern Matching
+
+The compiler may only optimize these specific MIR patterns:
+
+1. **ExternRef Pass-Through**: `_1 = ExternRef::new(_2); _3 = call foo(_1)`
+   - Allowed: Treat as opaque scalar, lower to WASM externref, elide wrapper construction
+   - Forbidden: Load/store folding, assuming purity, CSE across calls
+
+2. **SharedSlice Load**: `_elt = (*(_slice.ptr + idx))` where `T: Pod`
+   - Allowed: Direct WASM loads, vectorization, loop unrolling
+   - Forbidden: Removing bounds checks unless proven, introducing atomics
+
+3. **Pod Copy**: `_2 = _1` where `T: Pod`
+   - Allowed: memcpy, register moves, SIMD copy
+   - Forbidden: Assuming padding irrelevance across FFI
+
+4. **Component Boundary Call**: `_0 = call component::import_X(_1, _2)`
+   - Allowed: ABI lowering, validation insertion
+   - Forbidden: Assuming shared memory, reordering across component calls
+
+### Verification Infrastructure
+
+**wasm-recognition Lint Group**:
+- `wasm_unverified_invariant_use`: Optimization lacks invariant reference
+- `wasm_illegal_mir_shape`: Transformation matches non-whitelisted pattern
+- `wasm_backend_specific_assumption`: Assumes LLVM/Cranelift-specific behavior
+- `wasm_unsafe_macro_semantics`: Assumes macro semantics beyond MIR
+
+**verify_wasm_invariants MIR Pass**:
+- Runs after borrow checking, before backend lowering
+- Records invariant references and MIR patterns for each optimization
+- Enforces backend neutrality and negative pattern detection
+- Fails compilation with explicit diagnostics if violations found
+
+### Optimization Safety Rules
+
+**Allowed Optimizations**:
+- Inline through wasm wrappers (if MIR pattern matches)
+- Merge monomorphizations when proven safe
+- Remove unused exports
+- Replace library calls with intrinsics (with invariant reference)
+- Reorder WASM sections
+
+**Forbidden Optimizations**:
+- Change observable behavior
+- Introduce UB if wasm crate is replaced
+- Assume unsafe blocks are safe
+- Break Rust aliasing or lifetime rules
+- Optimize based on undocumented layout
+
+**Escape Hatch Rule**: If an optimization cannot be expressed as inlining, dead-code elimination, or layout preservation, it does not belong in the compiler.
 
 ## Data Models
 
