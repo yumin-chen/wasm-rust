@@ -65,24 +65,11 @@ WasmRust is a **specialized Rust toolchain** that keeps the Rust frontend unchan
 
 WasmRust is structured as a **five-layer stack**:
 
-```
-┌─────────────────────────────┐
-│ Layer 5 — Tooling & Ecosystem│
-│ Registries, debugging, profiler│
-├─────────────────────────────┤
-│ Layer 4 — Compiler           │
-│ WasmIR, Cranelift, LLVM, PGO│
-├─────────────────────────────┤
-│ Layer 3 — Runtime Semantics  │
-│ Multi-memory, regions, threads│
-├─────────────────────────────┤
-│ Layer 2 — Component Model    │
-│ WIT-native imports/exports   │
-├─────────────────────────────┤
-│ Layer 1 — Core Language      │
-│ Linear types, effects, concurrency│
-└─────────────────────────────┘
-```
+- Layer 5 — **Tooling & Ecosystem**: Registries, debugging, profiler
+- Layer 4 — **Compiler**: WasmIR, Cranelift, LLVM, PGO
+- Layer 3 — **Runtime Semantics**: Multi-memory, regions, threads
+- Layer 2 — **Component Model**: WIT-native imports/exports
+- Layer 1 — **Core Language** Linear types, effects, concurrency
 
 ---
 
