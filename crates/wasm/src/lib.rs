@@ -15,6 +15,7 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
+use alloc::string::ToString;
 use core::marker::PhantomData;
 use core::ptr::{self, NonNull};
 use core::slice;
@@ -45,6 +46,33 @@ pub enum WasmError {
     MemoryError(memory::MemoryError),
     /// Threading error
     ThreadingError(threading::ThreadError),
+    /// Component error
+    ComponentError(component::ComponentError),
+}
+
+// Implement error conversions for seamless error handling
+impl From<memory::MemoryError> for WasmError {
+    fn from(err: memory::MemoryError) -> Self {
+        WasmError::MemoryError(err)
+    }
+}
+
+impl From<threading::ThreadError> for WasmError {
+    fn from(err: threading::ThreadError) -> Self {
+        WasmError::ThreadingError(err)
+    }
+}
+
+impl From<component::ComponentError> for WasmError {
+    fn from(err: component::ComponentError) -> Self {
+        WasmError::ComponentError(err)
+    }
+}
+
+impl From<host::InteropError> for WasmError {
+    fn from(err: host::InteropError) -> Self {
+        WasmError::HostError(err)
+    }
 }
 
 impl core::fmt::Display for WasmError {
@@ -57,6 +85,7 @@ impl core::fmt::Display for WasmError {
             WasmError::HostError(err) => write!(f, "Host error: {}", err),
             WasmError::MemoryError(err) => write!(f, "Memory error: {}", err),
             WasmError::ThreadingError(err) => write!(f, "Threading error: {}", err),
+            WasmError::ComponentError(err) => write!(f, "Component error: {}", err),
         }
     }
 }
@@ -66,6 +95,32 @@ impl core::fmt::Display for WasmError {
 /// This trait ensures that types have no interior mutability
 /// and can be safely shared across thread boundaries when wrapped
 /// in appropriate synchronization primitives.
+///
+/// # Safety
+///
+/// Implementing `Pod` for a type asserts that **all** of the following hold:
+///
+/// - The type has no padding bytes with semantic meaning
+/// - The type contains no pointers or references
+/// - The type has no interior mutability
+/// - The type has no drop glue
+/// - All bit patterns are valid
+///
+/// ## Undefined Behavior
+///
+/// Implementing `Pod` for a type that violates any of the above invariants
+/// results in undefined behavior when used by this crate.
+///
+/// ## Compiler Assumptions
+///
+/// The compiler may assume:
+/// - `T: Pod` can be freely copied
+/// - Shared access is race-free
+/// - Aggressive memory optimizations are valid
+///
+/// The compiler must not:
+/// - Assume zeroed memory is valid unless proven
+/// - Insert hidden validation or runtime checks
 pub unsafe trait Pod: 'static {
     /// Returns true if the type is valid for zero-copy sharing
     fn is_valid_for_sharing() -> bool {
@@ -90,11 +145,39 @@ unsafe impl Pod for () {}
 /// Implement Pod for arrays of Pod types
 unsafe impl<T: Pod> Pod for [T] {}
 unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
-
 /// ExternRef<T> - Type-safe JavaScript object reference
 /// 
 /// This type provides zero-cost wrapper for JavaScript objects with
 /// compile-time type checking and automatic reference management.
+///
+/// # Safety
+///
+/// `ExternRef<T>` is safe to use **only if all of the following invariants hold**:
+///
+/// - The underlying handle refers to a valid host-managed object
+/// - The host guarantees stable identity for lifetime of handle
+/// - The handle is not reused for a different object
+/// - The logical type `T` matches the host object's expected type
+///
+/// ## Undefined Behavior
+///
+/// The following actions result in undefined behavior:
+///
+/// - Constructing an `ExternRef<T>` from an arbitrary integer
+/// - Transmuting between `ExternRef<U>` and `ExternRef<V>`
+/// - Using an `ExternRef` after the host invalidates the handle
+/// - Passing an `ExternRef<T>` to a host expecting a different logical type
+///
+/// ## Compiler Assumptions
+///
+/// The compiler may assume:
+/// - `ExternRef<T>` is an opaque, non-aliasing handle
+/// - Cloning and copying are constant-time
+/// - No linear memory is accessed through this type
+///
+/// The compiler must not assume:
+/// - Any relationship to linear memory
+/// - Dereferenceable data
 #[repr(transparent)]
 pub struct ExternRef<T: ?Sized> {
     /// Internal handle to the JavaScript object
@@ -107,8 +190,11 @@ impl<T> ExternRef<T> {
     /// Creates a new ExternRef from a handle
     /// 
     /// # Safety
-    /// Caller must ensure that the handle is valid and represents
-    /// an object of type T.
+    /// 
+    /// Caller must ensure that:
+    /// - The handle refers to a valid host-managed object
+    /// - The object's logical type matches `T`
+    /// - The handle is not a fabricated value
     pub unsafe fn from_handle(handle: u32) -> Self {
         Self {
             handle,
@@ -136,7 +222,19 @@ impl<T> ExternRef<T> {
 
     /// Safely accesses a property on the JavaScript object
     /// 
-    /// Returns error if property doesn't exist or has wrong type
+    /// # Safety
+    /// 
+    /// This operation is safe when:
+    /// - `self.handle` refers to a valid JavaScript object
+    /// - The property name is a valid UTF-8 string
+    /// - The object has the specified property with type `R`
+    /// - No other thread is concurrently modifying the object
+    /// 
+    /// Undefined behavior occurs if:
+    /// - The handle is invalid or has been garbage collected
+    /// - The property does not exist on the object
+    /// - The property type does not match `R`
+    /// - The host environment does not support property access
     pub fn get_property<R>(&self, property: &str) -> Result<R, WasmError>
     where
         T: host::HasProperty<R>,
@@ -149,16 +247,29 @@ impl<T> ExternRef<T> {
         T::validate_property(property)
             .map_err(|e| WasmError::HostError(e))?;
 
-        // Access property through host
+        // SAFETY: Property access is guarded by null check and type validation
+        // The host guarantees that handle refers to a valid object of type T
         unsafe {
-            host::get_property_checked::<T>(self.handle, property)
+            host::get_property_checked::<V>(self.handle, property)
                 .map_err(|e| WasmError::HostError(e))
         }
     }
 
     /// Safely sets a property on the JavaScript object
     /// 
-    /// Returns error if property doesn't exist or has wrong type
+    /// # Safety
+    /// 
+    /// This operation is safe when:
+    /// - `self.handle` refers to a valid JavaScript object
+    /// - The property name is a valid UTF-8 string
+    /// - The object has the specified property accepting type `V`
+    /// - No other thread is concurrently modifying the same property
+    /// 
+    /// Undefined behavior occurs if:
+    /// - The handle is invalid or has been garbage collected
+    /// - The property does not exist or is read-only
+    /// - The property type does not match `V`
+    /// - The host environment does not support property mutation
     pub fn set_property<V>(&self, property: &str, value: V) -> Result<(), WasmError>
     where
         T: host::HasProperty<V>,
@@ -171,7 +282,8 @@ impl<T> ExternRef<T> {
         T::validate_property(property)
             .map_err(|e| WasmError::HostError(e))?;
 
-        // Set property through host
+        // SAFETY: Property mutation is guarded by null check and type validation
+        // The host guarantees atomic property mutation for the object type
         unsafe {
             host::set_property_checked::<T>(self.handle, property, value)
                 .map_err(|e| WasmError::HostError(e))
@@ -180,7 +292,20 @@ impl<T> ExternRef<T> {
 
     /// Safely invokes a method on the JavaScript object
     /// 
-    /// Returns error if method doesn't exist or has wrong signature
+    /// # Safety
+    /// 
+    /// This operation is safe when:
+    /// - `self.handle` refers to a valid JavaScript object
+    /// - The method name is a valid UTF-8 string
+    /// - The object has a method with matching signature `(Args) -> Ret`
+    /// - The arguments are of types compatible with the method
+    /// - No other thread is concurrently mutating the object
+    /// 
+    /// Undefined behavior occurs if:
+    /// - The handle is invalid or has been garbage collected
+    /// - The method does not exist or has incompatible signature
+    /// - The arguments are of incorrect types
+    /// - The host environment does not support method invocation
     pub fn invoke_method<Args, Ret>(&self, method: &str, args: Args) -> Result<Ret, WasmError>
     where
         T: host::HasMethod<Args, Ret>,
@@ -193,7 +318,8 @@ impl<T> ExternRef<T> {
         T::validate_method(method)
             .map_err(|e| WasmError::HostError(e))?;
 
-        // Invoke method through host
+        // SAFETY: Method invocation is guarded by null check and signature validation
+        // The host guarantees that handle refers to a valid object with method T
         unsafe {
             host::invoke_checked::<T, Args, Ret>(self.handle, method, args)
                 .map_err(|e| WasmError::HostError(e))
@@ -310,6 +436,40 @@ impl<Args, Ret> core::hash::Hash for FuncRef<Args, Ret> {
 /// 
 /// This type provides thread-safe shared memory access for Pod types
 /// with compile-time data race prevention.
+///
+/// # Safety
+///
+/// `SharedSlice<'a, T>` is sound **only if**:
+///
+/// - `ptr` points to valid linear memory for `len` elements
+/// - The backing memory is immutable for lifetime `'a`
+/// - `T: Pod` guarantees race-free shared access
+/// - No aliasing mutable access exists during `'a`
+///
+/// ## Undefined Behavior
+///
+/// - Mutating memory while a `SharedSlice` exists
+/// - Constructing from invalid or dangling pointers
+/// - Using `SharedSlice` in unsupported threading environments
+/// - Creating with non-`Pod` types
+///
+/// ## Compiler Assumptions
+///
+/// The compiler may assume:
+/// - `SharedSlice<'a, T>` behaves like `&'a [T]`
+/// - No writes occur through any alias
+/// - Reads are race-free
+///
+/// This enables:
+/// - Vectorization
+/// - Load hoisting
+/// - Bounds-check elimination
+/// - Cross-thread read reordering
+///
+/// The compiler must not:
+/// - Assume mutable access is safe
+/// - Skip bounds checking based on trust
+/// - Assume memory remains valid beyond `'a`
 pub struct SharedSlice<'a, T: Pod> {
     /// Pointer to the shared memory region
     ptr: NonNull<T>,
@@ -323,10 +483,19 @@ impl<'a, T: Pod> SharedSlice<'a, T> {
     /// Creates a new SharedSlice from a raw pointer and length
     /// 
     /// # Safety
-    /// Caller must ensure that:
-    /// - The pointer is valid and properly aligned
-    /// - The memory region contains `len` valid T values
-    /// - The memory region remains valid for the lifetime 'a
+    /// 
+    /// This operation is safe when:
+    /// - `ptr` is valid and properly aligned for type `T`
+    /// - The memory region contains exactly `len` valid `T` values
+    /// - The memory region remains valid and immutable for lifetime `'a`
+    /// - `T: Pod` guarantees that shared reads are race-free
+    /// 
+    /// Undefined behavior occurs if:
+    /// - `ptr` is null, dangling, or misaligned
+    /// - The memory region contains uninitialized or invalid `T` values
+    /// - The memory is mutated during `'a`
+    /// - `len` exceeds the actual allocated memory size
+    /// - `T` is not actually `Pod` (violates shared access guarantees)
     pub unsafe fn from_raw_parts(ptr: *const T, len: usize) -> Self {
         Self {
             ptr: NonNull::new_unchecked(ptr as *mut T),

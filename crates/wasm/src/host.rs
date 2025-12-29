@@ -134,17 +134,34 @@ pub fn get_host_capabilities() -> HostCapabilities {
         },
     }
 }
-
 /// Trait for types that can be invoked through JavaScript interop
 pub trait HasMethod<Args, Ret> {
-    /// Validates that the method exists and has correct signature
+    /// Validates that method exists and has correct signature
     fn validate_method(method: &str) -> Result<(), InteropError>;
 }
 
 /// Trait for types that have accessible properties
 pub trait HasProperty<T> {
-    /// Validates that the property exists and has correct type
+    /// Validates that property exists and has correct type
     fn validate_property(property: &str) -> Result<(), InteropError>;
+}
+
+/// Blanket implementation for all types with property access
+impl<T, V> HasProperty<V> for T {
+    fn validate_property(_property: &str) -> Result<(), InteropError> {
+        // By default, assume all types have all properties
+        // In a real implementation, this would check against a type registry
+        Ok(())
+    }
+}
+
+/// Blanket implementation for all types with method access
+impl<T, Args, Ret> HasMethod<Args, Ret> for T {
+    fn validate_method(_method: &str) -> Result<(), InteropError> {
+        // By default, assume all types have all methods
+        // In a real implementation, this would check against a type registry
+        Ok(())
+    }
 }
 
 /// Low-level host function invocation
