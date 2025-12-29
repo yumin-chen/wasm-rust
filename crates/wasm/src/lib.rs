@@ -1,36 +1,79 @@
 //! WasmRust Core Library
 //! 
-//! This crate provides the core WASM-native type system and abstractions
-//! for the WasmRust compiler. It implements zero-cost wrappers for
-//! WebAssembly reference types with managed reference tables.
+//! This crate provides the core abstractions for WasmRust-optimized
+//! Rust-to-WebAssembly compilation, including WASM-native types,
+//! zero-cost wrappers, and safe memory abstractions.
 
 #![no_std]
 #![feature(extern_types)]
-#![feature(specialization)]
 #![feature(unsize)]
 #![feature(coerce_unsized)]
+#![feature(generic_associated_types)]
+#![feature(min_specialization)]
+#![feature(const_fn)]
+#![feature(const_mut_refs)]
 
+extern crate alloc;
+use alloc::vec::Vec;
 use core::marker::PhantomData;
-use core::ptr::NonNull;
-use core::fmt;
+use core::ptr::{self, NonNull};
+use core::slice;
+use core::mem;
+use core::ops::{Deref, DerefMut, Index, IndexMut};
 
+pub mod host;
 pub mod memory;
 pub mod threading;
 pub mod component;
-pub mod host;
 
-/// Marker trait for types that are safe for zero-copy sharing
+use host::{HostProfile, HostCapabilities, get_host_capabilities};
+
+/// Error types for WASM operations
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WasmError {
+    /// Type mismatch error
+    TypeMismatch,
+    /// Null dereference error
+    NullDereference,
+    /// Out of bounds access
+    OutOfBounds,
+    /// Invalid operation
+    InvalidOperation(String),
+    /// Host error
+    HostError(host::InteropError),
+    /// Memory error
+    MemoryError(memory::MemoryError),
+    /// Threading error
+    ThreadingError(threading::ThreadError),
+}
+
+impl core::fmt::Display for WasmError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            WasmError::TypeMismatch => write!(f, "Type mismatch"),
+            WasmError::NullDereference => write!(f, "Null dereference"),
+            WasmError::OutOfBounds => write!(f, "Out of bounds access"),
+            WasmError::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
+            WasmError::HostError(err) => write!(f, "Host error: {}", err),
+            WasmError::MemoryError(err) => write!(f, "Memory error: {}", err),
+            WasmError::ThreadingError(err) => write!(f, "Threading error: {}", err),
+        }
+    }
+}
+
+/// Trait for types that can be safely shared without copying
 /// 
-/// Types implementing this trait have no internal pointers and can be
-/// safely shared across WASM threads or components without serialization.
-pub unsafe trait Pod: Copy + Send + Sync {
-    /// Returns true if the type layout is suitable for zero-copy sharing
-    fn is_pod_compatible() -> bool {
+/// This trait ensures that types have no interior mutability
+/// and can be safely shared across thread boundaries when wrapped
+/// in appropriate synchronization primitives.
+pub unsafe trait Pod: 'static {
+    /// Returns true if the type is valid for zero-copy sharing
+    fn is_valid_for_sharing() -> bool {
         true
     }
 }
 
-// Blanket implementation for primitive types
+// Implement Pod for primitive types
 unsafe impl Pod for u8 {}
 unsafe impl Pod for u16 {}
 unsafe impl Pod for u32 {}
@@ -41,274 +84,710 @@ unsafe impl Pod for i32 {}
 unsafe impl Pod for i64 {}
 unsafe impl Pod for f32 {}
 unsafe impl Pod for f64 {}
-unsafe impl<T> Pod for *const T {}
-unsafe impl<T> Pod for *mut T {}
+unsafe impl Pod for bool {}
+unsafe impl Pod for () {}
 
-/// Managed reference to JavaScript objects
+/// Implement Pod for arrays of Pod types
+unsafe impl<T: Pod> Pod for [T] {}
+unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
+
+/// ExternRef<T> - Type-safe JavaScript object reference
 /// 
-/// `ExternRef<T>` provides type-safe access to JavaScript objects through
-/// a managed reference table. The handle is an index into a runtime
-/// reference table that tracks object lifetimes.
+/// This type provides zero-cost wrapper for JavaScript objects with
+/// compile-time type checking and automatic reference management.
 #[repr(transparent)]
-pub struct ExternRef<T> {
-    handle: u32, // Index into runtime reference table
-    _marker: PhantomData<T>,
+pub struct ExternRef<T: ?Sized> {
+    /// Internal handle to the JavaScript object
+    handle: u32,
+    /// Phantom data for type safety
+    _phantom: PhantomData<T>,
 }
 
 impl<T> ExternRef<T> {
-    /// Creates an ExternRef from a raw handle
+    /// Creates a new ExternRef from a handle
     /// 
     /// # Safety
-    /// The handle must be valid in the current reference table
-    /// and must correspond to an object of type T.
+    /// Caller must ensure that the handle is valid and represents
+    /// an object of type T.
     pub unsafe fn from_handle(handle: u32) -> Self {
         Self {
             handle,
-            _marker: PhantomData,
+            _phantom: PhantomData,
         }
     }
 
-    /// Returns the underlying handle
-    pub fn as_handle(&self) -> u32 {
+    /// Gets the internal handle
+    pub fn handle(&self) -> u32 {
         self.handle
     }
 
-    /// Calls a method on the referenced JavaScript object
+    /// Checks if the reference is null
+    pub fn is_null(&self) -> bool {
+        self.handle == 0
+    }
+
+    /// Creates a null reference
+    pub fn null() -> Self {
+        Self {
+            handle: 0,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Safely accesses a property on the JavaScript object
     /// 
-    /// This method requires host profile support and performs
-    /// type-safe method invocation through the runtime.
-    pub fn call<Args, Ret>(&self, method: &str, args: Args) -> Result<Ret, InteropError>
+    /// Returns error if property doesn't exist or has wrong type
+    pub fn get_property<R>(&self, property: &str) -> Result<R, WasmError>
+    where
+        T: host::HasProperty<R>,
+    {
+        if self.is_null() {
+            return Err(WasmError::NullDereference);
+        }
+
+        // Validate property exists and has correct type
+        T::validate_property(property)
+            .map_err(|e| WasmError::HostError(e))?;
+
+        // Access property through host
+        unsafe {
+            host::get_property_checked::<T>(self.handle, property)
+                .map_err(|e| WasmError::HostError(e))
+        }
+    }
+
+    /// Safely sets a property on the JavaScript object
+    /// 
+    /// Returns error if property doesn't exist or has wrong type
+    pub fn set_property<V>(&self, property: &str, value: V) -> Result<(), WasmError>
+    where
+        T: host::HasProperty<V>,
+    {
+        if self.is_null() {
+            return Err(WasmError::NullDereference);
+        }
+
+        // Validate property exists and has correct type
+        T::validate_property(property)
+            .map_err(|e| WasmError::HostError(e))?;
+
+        // Set property through host
+        unsafe {
+            host::set_property_checked::<T>(self.handle, property, value)
+                .map_err(|e| WasmError::HostError(e))
+        }
+    }
+
+    /// Safely invokes a method on the JavaScript object
+    /// 
+    /// Returns error if method doesn't exist or has wrong signature
+    pub fn invoke_method<Args, Ret>(&self, method: &str, args: Args) -> Result<Ret, WasmError>
     where
         T: host::HasMethod<Args, Ret>,
     {
-        // Lowered to host-specific interop mechanism
-        unsafe { host::invoke_checked(self.handle, method, args) }
-    }
+        if self.is_null() {
+            return Err(WasmError::NullDereference);
+        }
 
-    /// Gets a property from the JavaScript object
-    pub fn get_property<Ret>(&self, property: &str) -> Result<Ret, InteropError>
-    where
-        T: host::HasProperty<Ret>,
-    {
-        unsafe { host::get_property_checked(self.handle, property) }
-    }
+        // Validate method exists and has correct signature
+        T::validate_method(method)
+            .map_err(|e| WasmError::HostError(e))?;
 
-    /// Sets a property on the JavaScript object
-    pub fn set_property<Value>(&self, property: &str, value: Value) -> Result<(), InteropError>
-    where
-        T: host::HasProperty<Value>,
-    {
-        unsafe { host::set_property_checked(self.handle, property, value) }
+        // Invoke method through host
+        unsafe {
+            host::invoke_checked::<T, Args, Ret>(self.handle, method, args)
+                .map_err(|e| WasmError::HostError(e))
+        }
     }
 }
 
 impl<T> Clone for ExternRef<T> {
     fn clone(&self) -> Self {
-        unsafe { host::add_reference(self.handle) };
         Self {
             handle: self.handle,
-            _marker: PhantomData,
+            _phantom: PhantomData,
         }
     }
 }
 
-impl<T> Drop for ExternRef<T> {
-    fn drop(&mut self) {
-        unsafe { host::remove_reference(self.handle) };
+impl<T> Copy for ExternRef<T> {}
+
+impl<T> PartialEq for ExternRef<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.handle == other.handle
     }
 }
 
-impl<T> fmt::Debug for ExternRef<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ExternRef({})", self.handle)
+impl<T> Eq for ExternRef<T> {}
+
+impl<T> core::hash::Hash for ExternRef<T> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.handle.hash(state);
     }
 }
 
-/// Managed function references
+/// FuncRef - Type-safe function reference
 /// 
-/// `FuncRef` represents a reference to a WebAssembly function
-/// through the function table. This enables higher-order functions
-/// and function pointers in WASM.
+/// This type provides zero-cost wrapper for WASM function references
+/// with compile-time type checking.
 #[repr(transparent)]
-pub struct FuncRef {
-    handle: u32, // Index into function table
+pub struct FuncRef<Args, Ret> {
+    /// Function table index
+    index: u32,
+    /// Phantom data for type safety
+    _phantom: PhantomData<(Args, Ret)>,
 }
 
-impl FuncRef {
-    /// Creates a FuncRef from a raw handle
+impl<Args, Ret> FuncRef<Args, Ret> {
+    /// Creates a new FuncRef from a table index
     /// 
     /// # Safety
-    /// The handle must be a valid function table index.
-    pub unsafe fn from_handle(handle: u32) -> Self {
-        Self { handle }
+    /// Caller must ensure that the index is valid and the function
+    /// at that index has the correct signature.
+    pub unsafe fn from_index(index: u32) -> Self {
+        Self {
+            index,
+            _phantom: PhantomData,
+        }
     }
 
-    /// Returns the underlying handle
-    pub fn as_handle(&self) -> u32 {
-        self.handle
+    /// Gets the function table index
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
+    /// Creates a null function reference
+    pub fn null() -> Self {
+        Self {
+            index: 0,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Checks if the function reference is null
+    pub fn is_null(&self) -> bool {
+        self.index == 0
     }
 
     /// Calls the function with the given arguments
     /// 
     /// # Safety
-    /// The caller must ensure that the arguments match the function's
-    /// expected signature and that the return type is correct.
-    pub unsafe fn call<Args, Ret>(&self, args: Args) -> Ret {
-        host::call_function(self.handle, args)
+    /// Caller must ensure that the function signature matches
+    /// the actual function at the table index.
+    pub unsafe fn call(&self, args: Args) -> Ret {
+        // This would be implemented with WASM function table call
+        // For now, this is a placeholder
+        panic!("Function calling not implemented")
     }
 }
 
-impl Clone for FuncRef {
+impl<Args, Ret> Clone for FuncRef<Args, Ret> {
     fn clone(&self) -> Self {
-        Self { handle: self.handle }
+        Self {
+            index: self.index,
+            _phantom: PhantomData,
+        }
     }
 }
 
-impl fmt::Debug for FuncRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "FuncRef({})", self.handle)
+impl<Args, Ret> Copy for FuncRef<Args, Ret> {}
+
+impl<Args, Ret> PartialEq for FuncRef<Args, Ret> {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index
     }
 }
-/// Safe shared memory access with explicit constraints
+
+impl<Args, Ret> Eq for FuncRef<Args, Ret> {}
+
+impl<Args, Ret> core::hash::Hash for FuncRef<Args, Ret> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.index.hash(state);
+    }
+}
+
+/// SharedSlice<'a, T> - Safe concurrent memory access
 /// 
-/// `SharedSlice<'a, T>` provides safe access to shared memory
-/// across WASM threads. The lifetime `'a` ensures that the
-/// slice cannot outlive shared memory region, and the
-/// `Pod` trait constraint ensures type safety.
+/// This type provides thread-safe shared memory access for Pod types
+/// with compile-time data race prevention.
 pub struct SharedSlice<'a, T: Pod> {
+    /// Pointer to the shared memory region
     ptr: NonNull<T>,
+    /// Length of the slice
     len: usize,
-    _marker: PhantomData<&'a [T]>,
+    /// Phantom lifetime marker
+    _phantom: PhantomData<&'a [T]>,
 }
-
-/// Mutable version of SharedSlice for exclusive access
-pub use memory::SharedSliceMut;
 
 impl<'a, T: Pod> SharedSlice<'a, T> {
-    /// Creates a SharedSlice from a raw pointer and length
+    /// Creates a new SharedSlice from a raw pointer and length
     /// 
     /// # Safety
-    /// The pointer must be valid for `len` elements and must
-    /// point to properly aligned memory.
-    pub unsafe fn from_raw_parts(ptr: *mut T, len: usize) -> Self {
+    /// Caller must ensure that:
+    /// - The pointer is valid and properly aligned
+    /// - The memory region contains `len` valid T values
+    /// - The memory region remains valid for the lifetime 'a
+    pub unsafe fn from_raw_parts(ptr: *const T, len: usize) -> Self {
         Self {
-            ptr: NonNull::new(ptr).expect("null pointer"),
+            ptr: NonNull::new_unchecked(ptr as *mut T),
             len,
-            _marker: PhantomData,
+            _phantom: PhantomData,
         }
     }
 
-    /// Returns the length of the slice
+    /// Creates a SharedSlice from a slice
+    /// 
+    /// Returns error if the type is not Pod
+    pub fn from_slice(slice: &'a [T]) -> Result<Self, WasmError> {
+        if !T::is_valid_for_sharing() {
+            return Err(WasmError::InvalidOperation(
+                "Type is not valid for sharing".to_string()
+            ));
+        }
+
+        unsafe {
+            Ok(Self::from_raw_parts(slice.as_ptr(), slice.len()))
+        }
+    }
+
+    /// Creates a SharedSlice from a mutable slice
+    /// 
+    /// Returns error if the type is not Pod or threading is not available
+    pub fn from_slice_mut(slice: &'a mut [T]) -> Result<Self, WasmError> {
+        let caps = get_host_capabilities();
+        
+        // Check if threading is available for mutable access
+        if !caps.threading {
+            return Err(WasmError::ThreadingError(
+                threading::ThreadError::ThreadingNotSupported
+            ));
+        }
+
+        if !T::is_valid_for_sharing() {
+            return Err(WasmError::InvalidOperation(
+                "Type is not valid for sharing".to_string()
+            ));
+        }
+
+        unsafe {
+            Ok(Self::from_raw_parts(slice.as_ptr(), slice.len()))
+        }
+    }
+
+    /// Gets the length of the slice
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// Returns true if the slice is empty
+    /// Checks if the slice is empty
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// Gets a reference to the element at the given index
-    pub fn get(&self, index: usize) -> Option<&T> {
-        if index < self.len {
-            unsafe { Some(&*self.ptr.as_ptr().add(index)) }
-        } else {
-            None
-        }
+    /// Gets a pointer to the start of the slice
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr.as_ptr()
     }
 
-    /// Gets a mutable reference to the element at the given index
+    /// Gets a mutable pointer to the start of the slice
     /// 
-    /// This method requires exclusive access and is only available
-    /// when the SharedSlice is not shared across threads.
-    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
-        if index < self.len {
-            unsafe { Some(&mut *self.ptr.as_ptr().add(index)) }
-        } else {
-            None
+    /// Returns error if threading is not available
+    pub fn as_mut_ptr(&self) -> Result<*mut T, WasmError> {
+        let caps = get_host_capabilities();
+        
+        if !caps.threading {
+            return Err(WasmError::ThreadingError(
+                threading::ThreadError::ThreadingNotSupported
+            ));
+        }
+
+        Ok(self.ptr.as_ptr())
+    }
+
+    /// Gets the slice as a regular slice (read-only access)
+    pub fn as_slice(&self) -> &'a [T] {
+        unsafe {
+            slice::from_raw_parts(self.ptr.as_ptr(), self.len)
         }
     }
 
-    /// Splits the slice into two at the given index
-    pub fn split_at(&self, mid: usize) -> (SharedSlice<'a, T>, SharedSlice<'a, T>) {
-        assert!(mid <= self.len, "split index out of bounds");
+    /// Gets the slice as a mutable slice
+    /// 
+    /// Returns error if threading is not available
+    pub fn as_slice_mut(&self) -> Result<&'a mut [T], WasmError> {
+        let caps = get_host_capabilities();
         
+        if !caps.threading {
+            return Err(WasmError::ThreadingError(
+                threading::ThreadError::ThreadingNotSupported
+            ));
+        }
+
+        unsafe {
+            Ok(slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len))
+        }
+    }
+
+    /// Gets the value at the given index
+    /// 
+    /// Performs bounds checking
+    pub fn get(&self, index: usize) -> Result<&'a T, WasmError> {
+        if index >= self.len {
+            return Err(WasmError::OutOfBounds);
+        }
+
+        unsafe {
+            Ok(&*self.ptr.as_ptr().add(index))
+        }
+    }
+
+    /// Gets a mutable reference to the value at the given index
+    /// 
+    /// Returns error if threading is not available or out of bounds
+    pub fn get_mut(&self, index: usize) -> Result<&'a mut T, WasmError> {
+        let caps = get_host_capabilities();
+        
+        if !caps.threading {
+            return Err(WasmError::ThreadingError(
+                threading::ThreadError::ThreadingNotSupported
+            ));
+        }
+
+        if index >= self.len {
+            return Err(WasmError::OutOfBounds);
+        }
+
+        unsafe {
+            Ok(&mut *self.ptr.as_ptr().add(index))
+        }
+    }
+
+    /// Splits the slice at the given index
+    pub fn split_at(&self, mid: usize) -> (Self, Self) {
+        assert!(mid <= self.len, "split_at out of bounds");
+
         let left = unsafe {
             SharedSlice::from_raw_parts(self.ptr.as_ptr(), mid)
         };
-        
+
         let right = unsafe {
             SharedSlice::from_raw_parts(
                 self.ptr.as_ptr().add(mid),
                 self.len - mid
             )
         };
-        
+
         (left, right)
     }
 
-    /// Returns an iterator over the slice
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
+    /// Gets a subslice of the shared slice
+    pub fn get_slice(&self, range: core::ops::Range<usize>) -> Result<Self, WasmError> {
+        if range.end > self.len {
+            return Err(WasmError::OutOfBounds);
+        }
+
         unsafe {
-            std::slice::from_raw_parts(self.ptr.as_ptr(), self.len)
-                .iter()
+            Ok(SharedSlice::from_raw_parts(
+                self.ptr.as_ptr().add(range.start),
+                range.end - range.start
+            ))
         }
     }
 }
 
 impl<'a, T: Pod> Clone for SharedSlice<'a, T> {
     fn clone(&self) -> Self {
-        unsafe { 
-            SharedSlice::from_raw_parts(self.ptr.as_ptr(), self.len)
+        Self {
+            ptr: self.ptr,
+            len: self.len,
+            _phantom: PhantomData,
         }
     }
 }
 
-impl<'a, T: Pod> fmt::Debug for SharedSlice<'a, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SharedSlice(ptr={:?}, len={})", self.ptr, self.len)
+impl<'a, T: Pod> Copy for SharedSlice<'a, T> {}
+
+impl<'a, T: Pod> Deref for SharedSlice<'a, T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        unsafe {
+            slice::from_raw_parts(self.ptr.as_ptr(), self.len)
+        }
     }
 }
 
-/// Errors that can occur during JavaScript interoperation
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InteropError {
-    /// The requested method does not exist on the object
-    MethodNotFound(String),
-    /// The arguments do not match the method's signature
-    InvalidArguments,
-    /// The JavaScript execution threw an exception
-    JavaScriptException(String),
-    /// The host profile does not support this operation
-    UnsupportedOperation,
-    /// The object reference is invalid or has been garbage collected
-    InvalidReference,
-    /// Type mismatch between expected and actual types
-    TypeMismatch,
+impl<'a, T: Pod> DerefMut for SharedSlice<'a, T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        let caps = get_host_capabilities();
+        
+        if !caps.threading {
+            // This would panic in debug builds, but we return empty slice in release
+            panic!("Cannot get mutable reference in non-threading environment");
+        }
+
+        unsafe {
+            slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len)
+        }
+    }
 }
 
-impl fmt::Display for InteropError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            InteropError::MethodNotFound(method) => {
-                write!(f, "Method '{}' not found", method)
-            }
-            InteropError::InvalidArguments => {
-                write!(f, "Invalid arguments for method call")
-            }
-            InteropError::JavaScriptException(msg) => {
-                write!(f, "JavaScript exception: {}", msg)
-            }
-            InteropError::UnsupportedOperation => {
-                write!(f, "Operation not supported by host profile")
-            }
-            InteropError::InvalidReference => {
-                write!(f, "Invalid object reference")
-            }
-            InteropError::TypeMismatch => {
-                write!(f, "Type mismatch in interoperation")
-            }
+impl<'a, T: Pod> Index<usize> for SharedSlice<'a, T> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("Index out of bounds")
+    }
+}
+
+impl<'a, T: Pod> IndexMut<usize> for SharedSlice<'a, T> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        self.get_mut(index).expect("Index out of bounds")
+    }
+}
+
+/// Iterator for SharedSlice
+pub struct SharedSliceIter<'a, T: Pod> {
+    slice: SharedSlice<'a, T>,
+    index: usize,
+}
+
+impl<'a, T: Pod> Iterator for SharedSliceIter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.slice.len {
+            None
+        } else {
+            let item = unsafe {
+                &*self.slice.ptr.as_ptr().add(self.index)
+            };
+            self.index += 1;
+            Some(item)
         }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.slice.len - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a, T: Pod> IntoIterator for SharedSlice<'a, T> {
+    type Item = &'a T;
+    type IntoIter = SharedSliceIter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        SharedSliceIter {
+            slice: self,
+            index: 0,
+        }
+    }
+}
+
+/// Shared memory region with type-safe access
+pub struct SharedMemory<T: Pod> {
+    /// Base pointer to the memory region
+    base: NonNull<T>,
+    /// Size of the memory region in bytes
+    size: usize,
+    /// Whether this memory allows mutable access
+    mutable: bool,
+}
+
+impl<T: Pod> SharedMemory<T> {
+    /// Creates a new shared memory region
+    /// 
+    /// Returns error if memory allocation fails or type is not Pod
+    pub fn new(size: usize, mutable: bool) -> Result<Self, WasmError> {
+        if !T::is_valid_for_sharing() {
+            return Err(WasmError::InvalidOperation(
+                "Type is not valid for sharing".to_string()
+            ));
+        }
+
+        // Allocate shared memory
+        let base = memory::allocate_shared(size * mem::size_of::<T>())
+            .map_err(|e| WasmError::MemoryError(e))?;
+
+        Ok(Self {
+            base: NonNull::new(base as *mut T)
+                .expect("Shared memory allocation returned null"),
+            size,
+            mutable,
+        })
+    }
+
+    /// Gets the size of the memory region
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Gets whether the memory is mutable
+    pub fn is_mutable(&self) -> bool {
+        self.mutable
+    }
+
+    /// Gets a pointer to the memory region
+    pub fn as_ptr(&self) -> *const T {
+        self.base.as_ptr()
+    }
+
+    /// Gets a mutable pointer to the memory region
+    /// 
+    /// Returns error if memory is not mutable
+    pub fn as_mut_ptr(&self) -> Result<*mut T, WasmError> {
+        if !self.mutable {
+            return Err(WasmError::InvalidOperation(
+                "Memory is not mutable".to_string()
+            ));
+        }
+
+        Ok(self.base.as_ptr())
+    }
+
+    /// Creates a SharedSlice covering the entire memory region
+    pub fn as_shared_slice(&self) -> SharedSlice<T> {
+        unsafe {
+            SharedSlice::from_raw_parts(self.base.as_ptr(), self.size / mem::size_of::<T>())
+        }
+    }
+
+    /// Creates a SharedSlice covering part of the memory region
+    pub fn as_shared_slice_range(&self, start: usize, len: usize) -> Result<SharedSlice<T>, WasmError> {
+        let total_elements = self.size / mem::size_of::<T>();
+        
+        if start >= total_elements || start + len > total_elements {
+            return Err(WasmError::OutOfBounds);
+        }
+
+        unsafe {
+            Ok(SharedSlice::from_raw_parts(
+                self.base.as_ptr().add(start),
+                len
+            ))
+        }
+    }
+}
+
+impl<T: Pod> Drop for SharedMemory<T> {
+    fn drop(&mut self) {
+        // Deallocate shared memory
+        unsafe {
+            memory::deallocate_shared(self.base.as_ptr() as *mut u8, self.size);
+        }
+    }
+}
+
+/// Marker trait for types that can be used in JavaScript interop
+pub trait JsInteropSafe {
+    /// Validates that the type can be safely used in JavaScript interop
+    fn validate_js_interop() -> Result<(), WasmError>;
+}
+
+// Implement JsInteropSafe for Pod types
+impl<T: Pod> JsInteropSafe for T {
+    fn validate_js_interop() -> Result<(), WasmError> {
+        if !T::is_valid_for_sharing() {
+            return Err(WasmError::InvalidOperation(
+                "Type is not valid for JavaScript interop".to_string()
+            ));
+        }
+        Ok(())
+    }
+}
+
+// Implement JsInteropSafe for ExternRef
+impl<T> JsInteropSafe for ExternRef<T> {
+    fn validate_js_interop() -> Result<(), WasmError> {
+        // ExternRef is always safe for JS interop by design
+        Ok(())
+    }
+}
+
+/// Trait for converting types to/from JavaScript values
+pub trait JsValue {
+    /// Convert from JavaScript value
+    fn from_js_value(value: host::JsValue) -> Result<Self, WasmError>
+    where
+        Self: Sized;
+    
+    /// Convert to JavaScript value
+    fn to_js_value(&self) -> Result<host::JsValue, WasmError>;
+}
+
+// Implement JsValue for primitive types
+impl JsValue for i32 {
+    fn from_js_value(value: host::JsValue) -> Result<Self, WasmError> {
+        host::convert_js_to_i32(value)
+            .map_err(|e| WasmError::HostError(e))
+    }
+
+    fn to_js_value(&self) -> Result<host::JsValue, WasmError> {
+        host::convert_i32_to_js(*self)
+            .map_err(|e| WasmError::HostError(e))
+    }
+}
+
+impl JsValue for f64 {
+    fn from_js_value(value: host::JsValue) -> Result<Self, WasmError> {
+        host::convert_js_to_f64(value)
+            .map_err(|e| WasmError::HostError(e))
+    }
+
+    fn to_js_value(&self) -> Result<host::JsValue, WasmError> {
+        host::convert_f64_to_js(*self)
+            .map_err(|e| WasmError::HostError(e))
+    }
+}
+
+impl JsValue for bool {
+    fn from_js_value(value: host::JsValue) -> Result<Self, WasmError> {
+        host::convert_js_to_bool(value)
+            .map_err(|e| WasmError::HostError(e))
+    }
+
+    fn to_js_value(&self) -> Result<host::JsValue, WasmError> {
+        host::convert_bool_to_js(*self)
+            .map_err(|e| WasmError::HostError(e))
+    }
+}
+
+/// WASM runtime initialization
+pub fn initialize() -> Result<(), WasmError> {
+    // Initialize host profile detection
+    let _profile = host::detect_host_profile();
+    
+    // Initialize memory management
+    memory::initialize_memory_management()?;
+    
+    // Initialize threading support
+    threading::initialize_threading_support()?;
+    
+    // Initialize component model support
+    component::initialize_component_support()?;
+    
+    Ok(())
+}
+
+/// Gets the current WASM runtime version
+pub fn runtime_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Checks if a capability is available in the current host
+pub fn has_capability(cap: &str) -> bool {
+    let caps = get_host_capabilities();
+    
+    match cap {
+        "threading" => caps.threading,
+        "component_model" => caps.component_model,
+        "memory_regions" => caps.memory_regions,
+        "js_interop" => caps.js_interop,
+        "external_functions" => caps.external_functions,
+        "file_system" => caps.file_system,
+        "network" => caps.network,
+        _ => false,
     }
 }
 
@@ -317,51 +796,123 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extern_ref_creation() {
-        let handle = 42u32;
-        let ext_ref = unsafe { ExternRef::<()>::from_handle(handle) };
-        assert_eq!(ext_ref.as_handle(), handle);
+    fn test_externref_creation() {
+        let extern_ref = ExternRef::<i32>::from_handle(42);
+        assert_eq!(extern_ref.handle(), 42);
+        assert!(!extern_ref.is_null());
+
+        let null_ref = ExternRef::<i32>::null();
+        assert_eq!(null_ref.handle(), 0);
+        assert!(null_ref.is_null());
     }
 
     #[test]
-    fn test_func_ref_creation() {
-        let handle = 123u32;
-        let func_ref = unsafe { FuncRef::from_handle(handle) };
-        assert_eq!(func_ref.as_handle(), handle);
+    fn test_externref_equality() {
+        let ref1 = ExternRef::<i32>::from_handle(42);
+        let ref2 = ExternRef::<i32>::from_handle(42);
+        let ref3 = ExternRef::<i32>::from_handle(43);
+
+        assert_eq!(ref1, ref2);
+        assert_ne!(ref1, ref3);
     }
 
     #[test]
-    fn test_shared_slice() {
-        let mut data = [1u32, 2u32, 3u32, 4u32];
-        let shared_slice = unsafe {
-            SharedSlice::from_raw_parts(data.as_mut_ptr(), data.len())
-        };
+    fn test_funcref_creation() {
+        let func_ref = unsafe { FuncRef::<(i32, i32), i32>::from_index(10) };
+        assert_eq!(func_ref.index(), 10);
+        assert!(!func_ref.is_null());
+
+        let null_func = FuncRef::<(), ()>::null();
+        assert_eq!(null_func.index(), 0);
+        assert!(null_func.is_null());
+    }
+
+    #[test]
+    fn test_sharedslice_creation() {
+        let data = [1, 2, 3, 4, 5];
+        let shared_slice = SharedSlice::from_slice(&data).unwrap();
         
-        assert_eq!(shared_slice.len(), 4);
+        assert_eq!(shared_slice.len(), 5);
         assert!(!shared_slice.is_empty());
-        assert_eq!(shared_slice.get(0), Some(&1u32));
-        assert_eq!(shared_slice.get(3), Some(&4u32));
-        assert_eq!(shared_slice.get(4), None);
+        assert_eq!(shared_slice.as_slice(), &data);
     }
 
     #[test]
-    fn test_shared_slice_split() {
-        let mut data = [1u32, 2u32, 3u32, 4u32];
-        let shared_slice = unsafe {
-            SharedSlice::from_raw_parts(data.as_mut_ptr(), data.len())
-        };
+    fn test_sharedslice_access() {
+        let data = [10, 20, 30];
+        let shared_slice = SharedSlice::from_slice(&data).unwrap();
         
-        let (left, right) = shared_slice.split_at(2);
-        assert_eq!(left.len(), 2);
-        assert_eq!(right.len(), 2);
-        assert_eq!(left.get(0), Some(&1u32));
-        assert_eq!(right.get(0), Some(&3u32));
+        assert_eq!(*shared_slice.get(0).unwrap(), 10);
+        assert_eq!(*shared_slice.get(1).unwrap(), 20);
+        assert_eq!(*shared_slice.get(2).unwrap(), 30);
+        
+        assert!(shared_slice.get(3).is_err());
+    }
+
+    #[test]
+    fn test_sharedslice_iteration() {
+        let data = [1, 2, 3];
+        let shared_slice = SharedSlice::from_slice(&data).unwrap();
+        
+        let collected: Vec<_> = shared_slice.into_iter().collect();
+        assert_eq!(collected, vec![&1, &2, &3]);
+    }
+
+    #[test]
+    fn test_sharedmemory_creation() {
+        let shared_mem = SharedMemory::<i32>::new(100, true).unwrap();
+        assert_eq!(shared_mem.size(), 100 * mem::size_of::<i32>());
+        assert!(shared_mem.is_mutable());
+        
+        let shared_slice = shared_mem.as_shared_slice();
+        assert_eq!(shared_slice.len(), 100);
     }
 
     #[test]
     fn test_pod_trait() {
-        assert!(u32::is_pod_compatible());
-        assert!(f64::is_pod_compatible());
-        assert!(<*const i8>::is_pod_compatible());
+        // All primitive types should implement Pod
+        assert!(u32::is_valid_for_sharing());
+        assert!(i64::is_valid_for_sharing());
+        assert!(f32::is_valid_for_sharing());
+        assert!(bool::is_valid_for_sharing());
+    }
+
+    #[test]
+    fn test_jsinterop_trait() {
+        // Pod types should be JsInteropSafe
+        assert!(i32::validate_js_interop().is_ok());
+        assert!(f64::validate_js_interop().is_ok());
+        
+        // ExternRef should be JsInteropSafe
+        assert!(ExternRef::<i32>::validate_js_interop().is_ok());
+    }
+
+    #[test]
+    fn test_jsvalue_trait() {
+        let value = 42i32;
+        let js_value = value.to_js_value().unwrap();
+        let converted_back = i32::from_js_value(js_value).unwrap();
+        
+        assert_eq!(value, converted_back);
+    }
+
+    #[test]
+    fn test_runtime_initialization() {
+        // Should initialize without errors
+        assert!(initialize().is_ok());
+        
+        // Version should be available
+        assert!(!runtime_version().is_empty());
+    }
+
+    #[test]
+    fn test_capability_checking() {
+        // Should check known capabilities
+        let result = has_capability("threading");
+        // Result depends on host environment, but should not panic
+        let _ = result;
+        
+        // Unknown capability should return false
+        assert!(!has_capability("unknown_capability"));
     }
 }

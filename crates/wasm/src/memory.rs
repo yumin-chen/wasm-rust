@@ -520,6 +520,55 @@ pub fn get_memory_stats() -> MemoryStats {
     }
 }
 
+/// Initialize memory management system
+pub fn initialize_memory_management() -> Result<(), MemoryError> {
+    // Initialize global memory tracking
+    ALLOCATED_MEMORY.store(0, Ordering::Relaxed);
+    
+    // Initialize memory region tracking
+    // In a real implementation, this would set up
+    // memory region validation and capability checking
+    Ok(())
+}
+
+/// Allocate shared memory for SharedMemory
+pub fn allocate_shared(size: usize) -> Result<*mut u8, MemoryError> {
+    let layout = unsafe { 
+        core::alloc::Layout::from_size_align(size, 8) 
+            .map_err(|_| MemoryError::InvalidSize)? 
+    };
+    
+    let ptr = unsafe { core::alloc::alloc(layout) };
+    
+    if ptr.is_null() {
+        return Err(MemoryError::OutOfMemory);
+    }
+    
+    ALLOCATED_MEMORY.fetch_add(size, Ordering::Relaxed);
+    Ok(ptr)
+}
+
+/// Deallocate shared memory
+pub fn deallocate_shared(ptr: *mut u8, size: usize) {
+    if !ptr.is_null() && size > 0 {
+        let layout = unsafe {
+            core::alloc::Layout::from_size_align(size, 8)
+                .unwrap_or_else(|_| core::alloc::Layout::new::<u8>())
+        };
+        
+        unsafe {
+            core::alloc::dealloc(ptr, layout);
+        }
+        
+        ALLOCATED_MEMORY.fetch_sub(size, Ordering::Relaxed);
+    }
+}
+
+/// Validate memory intent against host capabilities
+pub fn validate_memory_intent(intent: &MemoryIntent) -> Result<(), MemoryError> {
+    intent.validate()
+}
+
 /// Memory usage statistics
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryStats {

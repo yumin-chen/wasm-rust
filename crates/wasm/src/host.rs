@@ -367,11 +367,64 @@ unsafe fn wasmtime_remove_reference(handle: u32) {
     // Wasmtime-specific reference removal
     panic!("Wasmtime reference removal not implemented")
 }
-
 fn convert_result<T>(result: impl core::any::Any) -> Result<T, InteropError> {
-    // Convert the host result to the expected type
+    // Convert to host result to expected type
     // In a real implementation, this would handle type conversion
     panic!("Result conversion not implemented")
+}
+
+/// JavaScript value representation
+#[derive(Debug, Clone)]
+pub enum JsValue {
+    Undefined,
+    Null,
+    Boolean(bool),
+    Number(f64),
+    String(String),
+    Object(u32), // Handle to JavaScript object
+    Array(u32),  // Handle to JavaScript array
+    Function(u32), // Handle to JavaScript function
+}
+
+/// Converts JavaScript value to i32
+pub fn convert_js_to_i32(value: JsValue) -> Result<i32, InteropError> {
+    match value {
+        JsValue::Number(n) if n.fract() == 0.0 && n >= i32::MIN as f64 && n <= i32::MAX as f64 => {
+            Ok(n as i32)
+        }
+        _ => Err(InteropError::TypeMismatch("Expected number".to_string())),
+    }
+}
+
+/// Converts i32 to JavaScript value
+pub fn convert_i32_to_js(value: i32) -> Result<JsValue, InteropError> {
+    Ok(JsValue::Number(value as f64))
+}
+
+/// Converts JavaScript value to f64
+pub fn convert_js_to_f64(value: JsValue) -> Result<f64, InteropError> {
+    match value {
+        JsValue::Number(n) => Ok(n),
+        _ => Err(InteropError::TypeMismatch("Expected number".to_string())),
+    }
+}
+
+/// Converts f64 to JavaScript value
+pub fn convert_f64_to_js(value: f64) -> Result<JsValue, InteropError> {
+    Ok(JsValue::Number(value))
+}
+
+/// Converts JavaScript value to bool
+pub fn convert_js_to_bool(value: JsValue) -> Result<bool, InteropError> {
+    match value {
+        JsValue::Boolean(b) => Ok(b),
+        _ => Err(InteropError::TypeMismatch("Expected boolean".to_string())),
+    }
+}
+
+/// Converts bool to JavaScript value
+pub fn convert_bool_to_js(value: bool) -> Result<JsValue, InteropError> {
+    Ok(JsValue::Boolean(value))
 }
 
 #[cfg(test)]

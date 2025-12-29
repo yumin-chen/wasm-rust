@@ -1,0 +1,39 @@
+[package]
+name = "wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Zero-cost WebAssembly abstractions for Rust"
+authors = ["WasmRust Team"]
+repository = "https://github.com/wasmrust/wasmrust"
+documentation = "https://docs.wasmrust.org/wasm"
+
+[dependencies]
+# No external dependencies - dependency-free by design
+
+[features]
+default = []
+threads = []
+component-model = []
+std = []
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# WASM-specific dependencies when targeting WebAssembly
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Host-specific dependencies when not targeting WebAssembly
+
+[lib]
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[[test]]
+name = "structure_tests"
+path = "../../tests/structure_tests.rs"
+required-features = []
+
+[dev-dependencies]
+quickcheck = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = "forbid"
