@@ -1,6 +1,6 @@
 ---
 Status: Draft
-Version: 0.1.0
+Version: 0.1.1
 Date: 2025-12-29
 Type: Technical Specification Document
 ---
@@ -15,49 +15,54 @@ The design leverages Cranelift for fast development builds, LLVM for optimized r
 
 ## Architecture
 
-The WasmRust system follows a layered architecture that separates concerns while enabling tight integration:
+The WasmRust system follows a layered architecture that separates concerns while enabling tight integration, inspired by MoonBit's success with optional GC, fast Cranelift dev builds, and small binaries:
 
 ```mermaid
 graph TB
     subgraph "Layer 5: Tooling & Distribution"
         A[cargo-wasm CLI]
         B[Registry Federation]
-        C[Debug Tools]
-        D[Profiler]
+        C[Profiler & Debug Tools]
     end
     
     subgraph "Layer 4: Compiler Backend"
-        E[Cranelift Backend]
-        F[LLVM Backend]
-        G[Profile-Guided Optimization]
+        D[Cranelift Backend - Dev]
+        E[LLVM Backend - Release]
+        F[Profile-Guided Optimization]
     end
     
     subgraph "Layer 3: Runtime Services"
-        H[Memory Management]
-        I[Threading Runtime]
-        J[Component Linking]
+        G[Memory Management]
+        H[Threading / Structured Concurrency]
+        I[Component Linking / WIT Runtime]
     end
     
     subgraph "Layer 2: Language Extensions"
-        K[Component Model Macros]
-        L[WIT Integration]
-        M[Capability Annotations]
+        J[Component Model Macros / WIT Integration]
+        K[Capability Annotations]
+        L[GC Mode Attributes & Linear Types]
     end
     
     subgraph "Layer 1: Core Language"
-        N[WASM Native Types]
-        O[Linear Types]
-        P[Safe Abstractions]
+        M[WASM Native Types - ExternRef, FuncRef, SharedSlice]
+        N[Ownership & Linear Type Semantics]
+        O[GC-Native Types - GcArray, GcString, GcBox, GcRef]
     end
     
+    A --> D
     A --> E
-    A --> F
-    E --> H
-    F --> H
+    D --> G
+    E --> G
+    J --> M
     K --> N
-    L --> O
-    H --> P
+    G --> O
 ```
+
+**Benefits of Layered Architecture:**
+- Makes developer workflows and compilation flow explicit
+- Layers map directly to PRD/TSD requirements (host profiles, GC types, dual-mode)
+- Enables traceable interactions between language, runtime, compiler, and tooling
+- Supports MoonBit-inspired async-first constructs and optional GC
 
 ### Language Surface Contract
 
@@ -86,20 +91,24 @@ The formal Compiler ↔ Crate Contract establishes:
 
 ### Host Profile Support
 
-WasmRust supports different execution environments with varying capabilities:
+WasmRust supports different execution environments with varying capabilities, providing graceful fallback and clear performance contracts:
 
-| Host Profile | Threading | JS Interop | Component Model | Memory Regions |
-|--------------|-----------|------------|-----------------|----------------|
-| **Browser** | SharedArrayBuffer + COOP/COEP | Direct calls | Partial | No |
-| **Node.js** | Worker threads | Native bindings | Via polyfill | No |
-| **Wasmtime** | wasi-threads | Host functions | Full | Configurable |
-| **Embedded** | No | No | Partial | No |
+| Host Profile | Threading | JS Interop | Component Model | WasmGC | Performance Target |
+|--------------|-----------|------------|-----------------|--------|-------------------|
+| **Browser** | SharedArrayBuffer + COOP/COEP | Direct calls | Partial / polyfill | Native | JS call <100ns |
+| **Node.js** | Worker threads | Native bindings | Polyfill | Native via V8 | JS call <50ns |
+| **Wasmtime** | wasi-threads | Host functions | Full native | Native | JS call <25ns |
+| **Embedded** | None | None | Static linking only | Ownership only | Minimal runtime |
 
-**Performance guarantees apply only within supported host profile capabilities.**
+**Graceful Fallback Strategy:**
+- **Single-threaded fallback**: Automatic detection and adaptation when threading unavailable
+- **Component Model polyfills**: JS-based implementation for unsupported environments  
+- **GC mode adaptation**: Compile-time or load-time warnings for non-GC environments
+- **Performance guarantees apply only within supported host profile capabilities**
 
 ### Compilation Pipeline
 
-The compilation process follows a dual-backend approach with explicit WasmIR boundary:
+The compilation process follows a dual-backend approach with explicit WasmIR boundary, inspired by MoonBit's fast development iteration:
 
 ```mermaid
 graph LR
@@ -109,10 +118,12 @@ graph LR
     D -->|Development| E[Cranelift Backend]
     D -->|Release| F[LLVM Backend]
     E --> G[Fast WASM + Debug Info]
-    F --> H[Optimized WASM]
-    H --> I[wasm-opt]
-    I --> J[Component Model Wrapper]
+    F --> H[Optimized WASM + wasm-opt]
+    H --> I[Component Model Wrapper / WIT Bindings]
 ```
+
+**Development Builds**: Cranelift → <2s for 10k LOC, fast iteration (MoonBit-inspired performance)
+**Release Builds**: LLVM → PGO, optimized binary with maximum size reduction
 
 #### WasmIR: Stable Intermediate Representation
 
@@ -123,6 +134,8 @@ WasmIR serves as a stable boundary between frontend and backends, encoding:
 - Component Model calling conventions
 - Capability annotations for optimization
 - Ownership and linearity invariants
+- **GC types and dual-mode compilation semantics**
+- **Async-first constructs for WasmGC environments**
 
 #### Backend Contracts
 
@@ -258,7 +271,7 @@ pub struct GcRef<T> {
 
 #### Dual-Mode Compilation
 
-WasmRust supports both ownership-based and GC-based compilation modes:
+WasmRust supports both ownership-based and GC-based compilation modes with explicit boundaries:
 
 ```rust
 // Default ownership mode - uses Rust's standard ownership
@@ -267,7 +280,7 @@ fn process_data_ownership(data: Vec<u8>) -> String {
     String::from_utf8(data).unwrap()
 }
 
-// GC mode - uses garbage collection
+// GC mode - uses garbage collection (MoonBit-inspired)
 #[wasm::gc]
 fn process_data_gc(data: GcArray<u8>) -> GcString {
     // Garbage-collected types, no manual memory management
@@ -291,13 +304,39 @@ fn mixed_processing(input: &str) -> String {
     from_gc_mode(gc_result)
 }
 
-// Conversion functions with explicit boundaries
+// Explicit conversion functions (compiler enforces no implicit mixing)
 fn to_gc_mode(s: String) -> GcString {
     GcString::new(&s) // Explicit conversion
 }
 
 fn from_gc_mode(gc_s: GcString) -> String {
     gc_s.as_str().to_owned() // Explicit conversion
+}
+```
+
+#### Async-First Constructs for WasmGC
+
+WasmRust provides native async support that compiles to WasmGC continuations:
+
+```rust
+// Async functions in GC mode compile to WasmGC continuations
+#[wasm::gc]
+async fn fetch_and_process(url: GcString) -> Result<GcString, Error> {
+    let response = wasm::fetch(url).await?;
+    let data = response.text().await?;
+    Ok(process_data(data))
+}
+
+// Promise-like types for asynchronous operations
+#[wasm::gc]
+pub struct GcPromise<T> {
+    handle: wasm::gc::PromiseRef,
+    _marker: PhantomData<T>,
+}
+
+impl<T> GcPromise<T> {
+    pub async fn resolve(self) -> T { /* ... */ }
+    pub fn then<U>(self, f: impl FnOnce(T) -> U) -> GcPromise<U> { /* ... */ }
 }
 ```
 
@@ -788,19 +827,34 @@ All memory safety violations are caught at compile time through Rust's type syst
 
 ### Dual Testing Approach
 
-WasmRust employs both unit testing and property-based testing for comprehensive coverage:
+WasmRust employs both unit testing and property-based testing for comprehensive coverage, with specific focus on MoonBit-competitive performance validation:
 
 **Unit Tests**:
-- Specific examples demonstrating correct behavior
+- Concrete examples demonstrating correct behavior
 - Edge cases and boundary conditions  
+- Component interop (Zig/C integration with #[repr(C)] verification)
 - Integration points between components
 - Error condition handling
 
 **Property-Based Tests**:
 - Universal properties holding across all inputs
+- Binary size scaling, thin monomorphization effectiveness
+- Cranelift performance advantage, ownership rule enforcement
+- GC safety, JS call latency (<100ns browser, <50ns Node.js, <25ns Wasmtime)
+- Cross-language ABI compatibility
 - Comprehensive input coverage through randomization
 - Minimum 100 iterations per property test
-- Each test tagged with corresponding design property
+
+**Reproducibility Testing**:
+- Build determinism with hash comparison and version pinning
+- Profile normalization for consistent PGO results
+- Toolchain version embedding and verification
+
+**Failure Mode Testing**:
+- Threading fallback behavior when SharedArrayBuffer unavailable
+- Memory region validation with clear error messages
+- GC fallback or compile-time errors for non-GC environments
+- Component loading failure recovery
 
 ### Property-Based Testing Configuration
 
@@ -998,3 +1052,61 @@ fn js_interop_overhead(b: &mut Bencher) {
 }
 
 This comprehensive testing strategy ensures that WasmRust delivers on its performance, safety, and compatibility promises while maintaining the reliability expected from production compiler toolchains.
+
+## Developer Workflow
+
+WasmRust provides a streamlined developer experience from project creation to registry publication:
+
+```mermaid
+graph LR
+    A[cargo wasm new] --> B[Write Rust Code]
+    B --> C[cargo wasm build --dev]
+    C --> D[Debug & Test]
+    D --> E{Ready for Release?}
+    E -->|No| B
+    E -->|Yes| F[cargo wasm build --release]
+    F --> G[cargo wasm publish]
+    G --> H[Registry Federation]
+```
+
+### Sample Developer Commands
+
+```bash
+# Create new WasmRust project
+cargo wasm new my-component --template=gc-enabled
+
+# Development build (Cranelift, <2s for 10k LOC)
+cargo wasm build --dev --profile=browser
+
+# Release build (LLVM + PGO)
+cargo wasm build --release --pgo=production.prof
+
+# Test with property-based testing
+cargo wasm test --property-tests --iterations=1000
+
+# Debug memory layout
+cargo wasm debug --memory-layout --visualize
+
+# Publish to federated registry
+cargo wasm publish --registry=primary,eu-mirror,asia-mirror
+```
+
+### Build Profile Examples
+
+```toml
+# Cargo.toml
+[package.metadata.wasm]
+profiles = ["browser", "node", "wasmtime", "embedded"]
+gc_mode = "optional"  # "disabled", "optional", "required"
+async_support = true
+wit_auto_generate = true
+
+[package.metadata.wasm.browser]
+threading = "shared-array-buffer"
+js_interop = "direct"
+target_size = "2KB"  # MoonBit-competitive target
+
+[package.metadata.wasm.gc]
+types = ["GcArray", "GcString", "GcBox"]
+async_continuations = true
+```
