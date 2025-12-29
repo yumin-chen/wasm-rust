@@ -2,7 +2,7 @@
 
 **WasmRust** is a research-driven, production-oriented Rust-to-WebAssembly compilation system. It aims to make **Rust truly WASM-native**, not merely a language that targets WebAssembly.
 
-WasmRust extends Rust through **minimal, evidence-based compiler and library enhancements**, closing gaps in binary size, compilation speed, component interoperability, and host friction — all while preserving Rust’s safety guarantees.
+WasmRust extends Rust through **minimal, evidence-based compiler and library enhancements**, closing gaps in binary size, compilation speed, component interoperability, and host friction — all while preserving Rust’s safety guarantees. The focus of WasmRust is on **compilation correctness, binary size, and iteration speed**.
 
 > **Core Principle:**
 > WasmRust = rustc + WASM specialization, not a new language.
@@ -13,11 +13,11 @@ WasmRust extends Rust through **minimal, evidence-based compiler and library enh
 
 Despite Rust’s dominance in the WASM ecosystem (`wasmtime`, `wasmer`, `wit-bindgen`), developers face:
 
-* **Large binaries** – even simple programs can be 35 KB; alternative WASM-first languages can be smaller.
-* **Slow compilation** – LLVM backend + borrow checking slows iteration.
-* **JS interop friction** – glue layers add overhead and complexity.
-* **Steep learning curve** – ownership and lifetimes can be barriers.
-* **WASM Component Model misalignment** – Rust semantics do not always map cleanly to WASM interfaces.
+*   **Large binaries** – even simple programs can be 35 KB; alternative WASM-first languages can be smaller.
+*   **Slow compilation** – LLVM backend + borrow checking slows iteration.
+*   **JS interop friction** – glue layers add overhead and complexity.
+*   **Steep learning curve** – ownership and lifetimes can be barriers.
+*   **WASM Component Model misalignment** – Rust semantics do not always map cleanly to WASM interfaces.
 
 WasmRust asks:
 
@@ -49,15 +49,16 @@ WasmRust is a **specialized Rust toolchain** that keeps the Rust frontend unchan
 │   externref, threads, components, memory    │
 └─────────────────────────────────────────────┘
 ```
+
 ---
 
 ## 🌍 Design Philosophy
 
-1. **WASM-native semantics**: Model WebAssembly concepts (memory, resources, components) directly.
-2. **Safety without bloat**: Retain Rust’s memory safety while avoiding unnecessary runtime overhead.
-3. **Incremental adoption**: Interoperate with existing Rust, `wasm-bindgen`, and WASI code.
-4. **Global and federated**: Avoid centralized registries and vendor lock-in.
-5. **Evidence-driven**: Features are justified through benchmarks, size, or correctness.
+1.  **WASM-native semantics**: Model WebAssembly concepts (memory, resources, components) directly.
+2.  **Safety without bloat**: Retain Rust’s memory safety while avoiding unnecessary runtime overhead.
+3.  **Incremental adoption**: Interoperate with existing Rust, `wasm-bindgen`, and WASI code.
+4.  **Global and federated**: Avoid centralized registries and vendor lock-in.
+5.  **Evidence-driven**: Features are justified through benchmarks, size, or correctness.
 
 ---
 
@@ -92,41 +93,41 @@ WasmRust is structured as a **five-layer stack**:
 
 The foundation of WasmRust is the `crates/wasm` library. It is `no_std`, dependency-free, runtime-free, and compiler-agnostic. Most WASM semantics belong at the library boundary, providing the compiler with semantic hooks for optimization and allowing stable Rust users to adopt WASM-first APIs today.
 
-* **Linear Types**: Enforce use-once semantics for WASM resources to prevent leaks.
-  ```rust
-  #[wasm::linear]
-  struct CanvasContext(wasm::Handle);
+*   **Linear Types**: Enforce use-once semantics for WASM resources to prevent leaks.
+    ```rust
+    #[wasm::linear]
+    struct CanvasContext(wasm::Handle);
 
-  impl CanvasContext {
-      fn draw(&mut self) { /* ... */ }
-      // This consuming method moves ownership, preventing further use.
-      fn into_bitmap(self) -> ImageData { /* ... */ }
-  }
-  ```
-* **Structured Concurrency**: Scoped threads with automatic joining and lifetime-bound safety.
-  ```rust
-  use wasm::thread::scope;
+    impl CanvasContext {
+        fn draw(&mut self) { /* ... */ }
+        // This consuming method moves ownership, preventing further use.
+        fn into_bitmap(self) -> ImageData { /* ... */ }
+    }
+    ```
+*   **Structured Concurrency**: Scoped threads with automatic joining and lifetime-bound safety.
+    ```rust
+    use wasm::thread::scope;
 
-  #[wasm::export]
-  fn parallel_transform(data: SharedSlice<f32>) -> Result<(), Error> {
-      scope(|s| {
-          for chunk in data.chunks(1000) {
-              s.spawn(|| process(chunk)); // Lifetime tied to scope
-          }
-          // All threads are automatically joined here
-      })?;
-      Ok(())
-  }
-  ```
-* **Effect System**: Track side effects like JS calls or I/O at the type level to enable optimizations like dead-effect elimination.
-  ```rust
-  #[wasm::effect(js_call, atomic_read)]
-  fn fetch_and_cache(url: &str) -> Result<Vec<u8>, Error> {
-      let data = js::fetch(url)?;
-      CACHE.store(url, data);
-      Ok(data)
-  }
-  ```
+    #[wasm::export]
+    fn parallel_transform(data: SharedSlice<f32>) -> Result<(), Error> {
+        scope(|s| {
+            for chunk in data.chunks(1000) {
+                s.spawn(|| process(chunk)); // Lifetime tied to scope
+            }
+            // All threads are automatically joined here
+        })?;
+        Ok(())
+    }
+    ```
+*   **Effect System**: Track side effects like JS calls or I/O at the type level to enable optimizations like dead-effect elimination.
+    ```rust
+    #[wasm::effect(js_call, atomic_read)]
+    fn fetch_and_cache(url: &str) -> Result<Vec<u8>, Error> {
+        let data = js::fetch(url)?;
+        CACHE.store(url, data);
+        Ok(data)
+    }
+    ```
 
 #### Layer 2 — Component Model
 
@@ -186,14 +187,26 @@ graph LR
     H --> I[wasm-opt]
     I --> J[Component Wrapper]
 ```
+
+**WasmIR** is a stable intermediate representation that encodes:
+
+*   Linear memory operations with bounds checking.
+*   Reference types (`externref`, `funcref`) with lifetime tracking.
+*   Component Model calling conventions.
+*   Capability annotations for optimization.
+*   Ownership and linearity invariants.
+
 ---
+
 ## Repository Structure
 
 ```
-wasmrust/
+wasm-rust/
 ├── compiler/                # rustc extensions & backends
 │   ├── codegen-cranelift/   # WASM-tuned Cranelift backend
-│   └── codegen-llvm/        # WASM-optimized LLVM backend
+│   ├── codegen-llvm/        # WASM-optimized LLVM backend
+│   ├── verifier/            # Invariant checker pass [planned]
+│   └── lints/               # wasm-recognition lint group [planned]
 │
 ├── crates/
 │   ├── wasm/                # Core zero-cost WASM abstractions
@@ -203,6 +216,8 @@ wasmrust/
 │   └── cargo-wasm/          # WASM-aware Cargo frontend [planned]
 │
 ├── docs/
+│   ├── PRD-WasmRust.md      # WasmRust Prouct Requirements Document 
+│   ├── TSD-WasmRust.md      # WasmRust Technical Specification Document 
 │   ├── SAFETY.md            # Unsafe invariants per type / crate
 │   ├── compiler-contract.md # Formal compiler ↔ crate contracts
 │   ├── RFCs/
@@ -210,6 +225,8 @@ wasmrust/
 │
 └── ReadMe.md
 ```
+> Each crate has its own `ReadMe.md` and `Safety.md` files that describe its unsafe invariants and compiler contracts.
+
 ---
 
 ## Incremental Adoption
@@ -224,9 +241,17 @@ Native Component Model emission, Cranelift-accelerated builds, and advanced opti
 
 ## Contracts & Governance
 
-*   **Language Surface Contract**: Core (80%): Standard Rust; Extensions (15%): `wasm` crate; Plugins (4%): `-Z` flags; Hard Fork (<1%): Minimal changes if required.
-*   **Compiler ↔ Crate Contract**: The compiler assumes invariants for types like `ExternRef` and `SharedSlice` which are documented in `SAFETY.md` and checked by compiler passes.
-*   **Governance & Direction**: Upstream-friendly, library-first stabilization, and RFC-driven evolution.
+*   **Language Surface Contract**: Core (80%): Standard Rust; Extensions (15%): `wasm` crate; Plugins (4%): `-Z` flags; Hard Fork (<1%): Minimal changes if required. Should upstream Rust introduce conflicting changes, a six-month deprecation window with automatic migration tools will be provided.
+*   **Compiler ↔ Crate Contract**: The WasmRust compiler assumes certain invariants when compiling code that uses `crates/wasm`. Unsafe operations must maintain these invariants, which are documented in `SAFETY.md`. The `wasm-recognition` lint group will detect misuses. Key invariants include:
+    *   `ExternRef<T>` and `FuncRef` are opaque handles with valid lifetime markers.
+    *   `SharedSlice<T>` contains only `Pod` types; aliasing and bounds are enforced.
+    *   Linear types (`#[wasm::linear]`) follow move semantics; the compiler assumes no implicit copies.
+    *   Component imports/exports use WIT-derived types; the ABI must match exactly.
+*   **Governance & Direction**: 
+    *   Upstream-friendly design.
+    *   Library APIs stabilize before compiler features.
+    *   Avoids ecosystem fragmentation.
+    *   RFC-driven feature evolution.
 
 ---
 
@@ -246,6 +271,9 @@ Native Component Model emission, Cranelift-accelerated builds, and advanced opti
 | Node.js      | Worker threads                | Native bindings | Polyfill        | No             |
 | Wasmtime     | wasi-threads                  | Host functions  | Full            | Configurable   |
 | Embedded     | No                            | No              | Partial         | No             |
+
+> Performance guarantees apply only to supported profiles.
+
 ---
 
 ## Testing and Verification
@@ -298,6 +326,6 @@ Native Component Model emission, Cranelift-accelerated builds, and advanced opti
 ## Where to Start
 
 *   📦 Use `crates/wasm` for low-level WASM code today.
-*   📖 Read `docs/RFCs/0001-wasmrust-architecture.md`.
+*   📖 Read tech specs in [`docs/TSD-WasmRust.md`](docs/TSD-WasmRust.md).
 *   🧪 Experiment with Cranelift WASM builds (nightly).
 *   🛠️ Contribute to core abstractions before compiler work.
