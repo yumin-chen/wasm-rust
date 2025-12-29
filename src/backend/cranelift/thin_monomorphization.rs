@@ -4,10 +4,21 @@
 //! reducing code duplication while maintaining performance. It also provides
 //! streaming layout optimization for fast WASM instantiation and size analysis
 //! tools for code attribution.
+//! 
+//! The implementation follows the "indirect sharing" strategy where
+//! type-dependent parts are extracted into WasmTypeDescriptor
+//! and shared logic operates on opaque pointers.
 
 use crate::wasmir::{
     WasmIR, Signature, Type, Instruction, Terminator, BasicBlock, BlockId, Constant,
     Capability, OwnershipAnnotation, SourceLocation,
+};
+use crate::backend::cranelift::{
+    type_descriptor::{WasmTypeDescriptor, TypeDescriptorRegistry, DescriptorError},
+    mir_complexity::{FunctionComplexity, MirComplexityAnalyzer, FunctionSimilarityAnalyzer},
+    thinning_pass::{ThinningPass, ThinningResult, ThinningError},
+    size_analyzer::SizeAnalyzer,
+    streaming_optimizer::StreamingLayoutOptimizer,
 };
 use rustc_middle::ty::{self, TyS, TyKind, Instance};
 use rustc_middle::mir::{Body, BasicBlock, Terminator};
@@ -28,6 +39,20 @@ pub struct ThinMonomorphizationContext {
     streaming_layout: StreamingLayout,
     /// Optimization flags
     optimization_flags: MonomorphizationFlags,
+    /// Type descriptor registry
+    type_registry: TypeDescriptorRegistry,
+    /// MIR complexity analyzer
+    complexity_analyzer: MirComplexityAnalyzer,
+    /// Thinning pass implementation
+    thinning_pass: ThinningPass,
+    /// Size analyzer
+    size_analyzer: Option<SizeAnalyzer>,
+    /// Streaming layout optimizer
+    streaming_optimizer: Option<StreamingLayoutOptimizer>,
+    /// Last analysis results
+    last_complexity_analysis: Vec<FunctionComplexity>,
+    /// Last thinning results
+    last_thinning_results: Vec<ThinningResult>,
 }
 
 /// Function identifier for tracking instances
@@ -219,6 +244,19 @@ pub enum RelocationType {
     MemoryAccess,
 }
 
+/// Optimization result with detailed information
+#[derive(Debug, Clone)]
+pub struct OptimizationResult {
+    /// Optimized functions
+    pub functions: Vec<WasmIR>,
+    /// Thinning transformation results
+    pub thinning_results: Vec<ThinningResult>,
+    /// Complexity analysis results
+    pub complexity_analysis: Vec<FunctionComplexity>,
+    /// Total size reduction percentage
+    pub size_reduction: f64,
+}
+
 /// Monomorphization errors
 #[derive(Debug, Clone)]
 pub enum MonomorphizationError {
@@ -232,6 +270,24 @@ pub enum MonomorphizationError {
     CacheSizeExceeded,
     /// Optimization failed
     OptimizationFailed(String),
+    /// Thinning transformation error
+    ThinningError(ThinningError),
+    /// Type descriptor error
+    DescriptorError(DescriptorError),
+    /// Size analysis error
+    SizeAnalysisError(String),
+}
+
+impl From<ThinningError> for MonomorphizationError {
+    fn from(err: ThinningError) -> Self {
+        MonomorphizationError::ThinningError(err)
+    }
+}
+
+impl From<DescriptorError> for MonomorphizationError {
+    fn from(err: DescriptorError) -> Self {
+        MonomorphizationError::DescriptorError(err)
+    }
 }
 
 impl std::fmt::Display for MonomorphizationError {
@@ -252,6 +308,15 @@ impl std::fmt::Display for MonomorphizationError {
             MonomorphizationError::OptimizationFailed(msg) => {
                 write!(f, "Optimization failed: {}", msg)
             }
+            MonomorphizationError::ThinningError(err) => {
+                write!(f, "Thinning error: {}", err)
+            }
+            MonomorphizationError::DescriptorError(err) => {
+                write!(f, "Type descriptor error: {}", err)
+            }
+            MonomorphizationError::SizeAnalysisError(msg) => {
+                write!(f, "Size analysis error: {}", msg)
+            }
         }
     }
 }
@@ -259,6 +324,19 @@ impl std::fmt::Display for MonomorphizationError {
 impl ThinMonomorphizationContext {
     /// Creates a new thin monomorphization context
     pub fn new(target: Target) -> Self {
+        Self::new_with_components(target, false, false)
+    }
+
+    /// Creates a new thin monomorphization context with components
+    pub fn new_with_components(
+        target: Target,
+        enable_size_analysis: bool,
+        enable_streaming: bool,
+    ) -> Self {
+        let type_registry = TypeDescriptorRegistry::new();
+        let complexity_analyzer = MirComplexityAnalyzer::new(target.clone());
+        let thinning_pass = ThinningPass::new(target.clone());
+        
         Self {
             target,
             function_instances: HashMap::new(),
@@ -270,32 +348,71 @@ impl ThinMonomorphizationContext {
                 relocations: Vec::new(),
             },
             optimization_flags: MonomorphizationFlags::default(),
+            type_registry,
+            complexity_analyzer,
+            thinning_pass,
+            size_analyzer: if enable_size_analysis {
+                Some(SizeAnalyzer::new(target.clone()))
+            } else {
+                None
+            },
+            streaming_optimizer: if enable_streaming {
+                Some(StreamingLayoutOptimizer::new(target.clone()))
+            } else {
+                None
+            },
+            last_complexity_analysis: Vec::new(),
+            last_thinning_results: Vec::new(),
         }
     }
 
-    /// Analyzes WasmIR for generic functions and optimizes them
+    /// Enhanced analyze and optimize with thinning and components
     pub fn analyze_and_optimize(
         &mut self,
         wasmir_module: &[WasmIR],
     ) -> Result<Vec<WasmIR>, MonomorphizationError> {
-        // Phase 1: Identify generic functions
-        self.identify_generic_functions(wasmir_module)?;
+        let optimization_result = self.analyze_and_optimize_with_tools(wasmir_module)?;
+        Ok(optimization_result.functions)
+    }
+
+    /// Enhanced analyze and optimize with detailed results
+    pub fn analyze_and_optimize_with_tools(
+        &mut self,
+        wasmir_module: &[WasmIR],
+    ) -> Result<OptimizationResult, MonomorphizationError> {
+        // Phase 1: MIR complexity analysis
+        let complexity_results = self.analyze_function_complexity(wasmir_module)?;
+        self.last_complexity_analysis = complexity_results.clone();
         
-        // Phase 2: Analyze call frequencies and instantiations
-        self.analyze_instantiations(wasmir_module)?;
+        // Phase 2: Identify thinning candidates
+        let thinning_candidates = self.identify_thinning_candidates(&complexity_results);
         
-        // Phase 3: Apply thin monomorphization
-        let optimized_functions = self.apply_thin_monomorphization(wasmir_module)?;
+        // Phase 3: Apply thin monomorphization to candidates
+        let thinning_results = self.apply_thinning_to_candidates(wasmir_module, &thinning_candidates)?;
+        self.last_thinning_results = thinning_results.clone();
         
-        // Phase 4: Optimize streaming layout
-        if self.optimization_flags.enable_streaming_layout {
-            self.optimize_streaming_layout(&optimized_functions)?;
+        // Phase 4: Size analysis
+        if let Some(analyzer) = &mut self.size_analyzer {
+            let size_report = analyzer.analyze_functions(wasmir_module)?;
+            self.update_size_stats(&size_report)?;
         }
         
-        // Phase 5: Generate final code with optimizations
-        let final_functions = self.generate_optimized_code(&optimized_functions)?;
+        // Phase 5: Streaming layout optimization
+        if self.optimization_flags.enable_streaming_layout {
+            if let Some(optimizer) = &mut self.streaming_optimizer {
+                self.streaming_layout = optimizer.optimize_layout(wasmir_module)?;
+            }
+        }
         
-        Ok(final_functions)
+        // Phase 6: Generate final optimized functions
+        let final_functions = self.generate_final_functions(wasmir_module, &thinning_results)?;
+        
+        Ok(OptimizationResult {
+            functions: final_functions,
+            thinning_results,
+            complexity_analysis: complexity_results,
+            size_reduction: self.size_stats.size_reduction,
+        })
     }
 
     /// Sets optimization flags
@@ -313,35 +430,192 @@ impl ThinMonomorphizationContext {
         &self.streaming_layout
     }
 
+    /// Gets type descriptor registry
+    pub fn get_type_registry(&self) -> &TypeDescriptorRegistry {
+        &self.type_registry
+    }
+
+    /// Gets the last complexity analysis results
+    pub fn get_last_complexity_analysis(&self) -> &[FunctionComplexity] {
+        &self.last_complexity_analysis
+    }
+
+    /// Gets the last thinning results
+    pub fn get_last_thinning_results(&self) -> &[ThinningResult] {
+        &self.last_thinning_results
+    }
+
+    /// Gets size analysis report if available
+    pub fn get_size_analysis_report(&self) -> Option<&crate::backend::cranelift::size_analyzer::SizeAnalysisReport> {
+        self.size_analyzer.as_ref().map(|analyzer| analyzer.get_last_report())
+    }
+
     /// Resets optimization statistics
     pub fn reset_stats(&mut self) {
         self.size_stats = CodeSizeStats::default();
     }
 
-    /// Identifies generic functions in WasmIR module
-    fn identify_generic_functions(
+    /// Analyzes function complexity using MIR analysis
+    fn analyze_function_complexity(
         &mut self,
         wasmir_module: &[WasmIR],
-    ) -> Result<(), MonomorphizationError> {
-        for (index, function) in wasmir_module.iter().enumerate() {
-            if self.is_generic_function(function) {
-                let generic_signature = self.extract_generic_signature(function)?;
-                let function_id = FunctionId(index as u64);
+    ) -> Result<Vec<FunctionComplexity>, MonomorphizationError> {
+        let mut complexity_results = Vec::new();
+        
+        for function in wasmir_module {
+            // Create a mock MIR body for analysis
+            // In practice, this would get the actual MIR from rustc
+            let mock_body = self.create_mock_mir_body(function)?;
+            
+            let analysis = self.complexity_analyzer.analyze_function(
+                &mock_body,
+                /* instance */ Instance { /* dummy */ },
+                &function.name,
+            );
+            
+            complexity_results.push(analysis);
+        }
+        
+        Ok(complexity_results)
+    }
+
+    /// Creates a mock MIR body from WasmIR for analysis
+    fn create_mock_mir_body(&self, function: &WasmIR) -> Result<Body<'_>, MonomorphizationError> {
+        // This is a simplified mock - in practice, this would use actual MIR
+        // For now, we estimate complexity from WasmIR structure
+        
+        // Count basic blocks and instructions to estimate complexity
+        let basic_block_count = function.basic_blocks.len();
+        let instruction_count = function.instruction_count();
+        let generic_type_count = function.signature.params.iter()
+            .filter(|ty| self.contains_generic_type(ty))
+            .count();
+        
+        // Create mock analysis based on WasmIR structure
+        let complexity_score = (basic_block_count as f64 * 1.0) + 
+                              (instruction_count as f64 * 0.1) + 
+                              (generic_type_count as f64 * 3.0);
+        
+        // Return a mock body (this would be the actual MIR in practice)
+        Err(MonomorphizationError::OptimizationFailed(
+            "Mock MIR creation not implemented".to_string()
+        ))
+    }
+
+    /// Identifies thinning candidates from complexity analysis
+    fn identify_thinning_candidates(
+        &self,
+        complexity_results: &[FunctionComplexity],
+    ) -> Vec<usize> {
+        complexity_results
+            .iter()
+            .enumerate()
+            .filter(|(_, analysis)| analysis.is_thinning_candidate)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Applies thinning to identified candidates
+    fn apply_thinning_to_candidates(
+        &mut self,
+        wasmir_module: &[WasmIR],
+        candidate_indices: &[usize],
+    ) -> Result<Vec<ThinningResult>, MonomorphizationError> {
+        let mut thinning_results = Vec::new();
+        
+        for &index in candidate_indices {
+            if index < wasmir_module.len() {
+                let function = &wasmir_module[index];
                 
-                let generic_function = GenericFunction {
-                    id: function_id,
-                    signature: generic_signature,
-                    common_instantiations: Vec::new(),
-                    total_instantiations: 0,
-                    code_size: function.instruction_count(),
-                };
+                // Determine concrete types for this function
+                let concrete_types = self.extract_concrete_types(function)?;
                 
-                self.function_instances.insert(function_id, generic_function);
-                self.size_stats.generic_functions_found += 1;
+                // Apply thinning transformation
+                let thinning_result = self.thinning_pass.apply_thinning(
+                    function,
+                    &concrete_types,
+                    &self.last_complexity_analysis[index],
+                ).map_err(|e| MonomorphizationError::OptimizationFailed(
+                    format!("Thinning failed for {}: {}", function.name, e)
+                ))?;
+                
+                thinning_results.push(thinning_result);
             }
         }
         
+        Ok(thinning_results)
+    }
+
+    /// Extracts concrete types for a generic function
+    fn extract_concrete_types(&self, function: &WasmIR) -> Result<Vec<Type>, MonomorphizationError> {
+        let mut concrete_types = Vec::new();
+        
+        // Analyze function signature to determine concrete types
+        for param_type in &function.signature.params {
+            if !self.contains_generic_type(param_type) {
+                concrete_types.push(param_type.clone());
+            }
+        }
+        
+        // If no concrete types found, use common defaults
+        if concrete_types.is_empty() {
+            concrete_types = vec![
+                Type::I32, Type::I64, Type::F32, Type::F64,
+                Type::ExternRef("String".to_string()),
+                Type::Array { 
+                    element_type: Box::new(Type::I32),
+                    size: Some(10),
+                },
+            ];
+        }
+        
+        Ok(concrete_types)
+    }
+
+    /// Updates size statistics from size analysis
+    fn update_size_stats(&mut self, size_report: &crate::backend::cranelift::size_analyzer::SizeAnalysisReport) -> Result<(), MonomorphizationError> {
+        // Update statistics based on size analysis results
+        self.size_stats.functions_optimized = size_report.optimized_functions.len();
+        self.size_stats.total_size_before = size_report.total_size_before;
+        self.size_stats.total_size_after = size_report.total_size_after;
+        
+        if self.size_stats.total_size_before > 0 {
+            let reduction = self.size_stats.total_size_before - self.size_stats.total_size_after;
+            self.size_stats.size_reduction = (reduction as f64 / self.size_stats.total_size_before as f64) * 100.0;
+        }
+        
         Ok(())
+    }
+
+    /// Generates final optimized functions combining thinned and non-thinned functions
+    fn generate_final_functions(
+        &mut self,
+        wasmir_module: &[WasmIR],
+        thinning_results: &[ThinningResult],
+    ) -> Result<Vec<WasmIR>, MonomorphizationError> {
+        let mut final_functions = Vec::new();
+        
+        // Track which functions were thinned
+        let mut thinned_function_names = HashSet::new();
+        
+        // Add thinned functions and their shims
+        for thinning_result in thinning_results {
+            thinned_function_names.insert(thinning_result.thinned_function.name.clone());
+            final_functions.push(thinning_result.thinned_function.clone());
+            final_functions.extend(thinning_result.shim_functions.clone());
+            
+            // Update statistics
+            self.size_stats.monomorphizations_performed += 1;
+        }
+        
+        // Add non-thinned functions unchanged
+        for function in wasmir_module {
+            if !thinned_function_names.contains(&function.name) {
+                final_functions.push(function.clone());
+            }
+        }
+        
+        Ok(final_functions)
     }
 
     /// Checks if a function is generic
