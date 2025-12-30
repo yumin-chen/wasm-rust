@@ -5,8 +5,12 @@
 //! the boundary layer that encodes WASM-specific optimizations,
 //! ownership annotations, and capability hints.
 
-use std::collections::HashMap;
-use std::fmt;
+use alloc::collections::BTreeMap as HashMap;
+use alloc::vec::{self, Vec};
+use alloc::string::{String, ToString};
+use alloc::boxed::Box;
+use alloc::format;
+use core::fmt;
 
 /// WasmIR - Stable Intermediate Representation
 /// 
@@ -322,7 +326,7 @@ pub enum Operand {
     FuncRef(u32),
     
     /// Memory address
-    MemoryAddress(Operand),
+    MemoryAddress(Box<Operand>),
     
     /// Stack value (temporary)
     StackValue(u32),
@@ -517,7 +521,7 @@ impl WasmIR {
         }
 
         // Check that all operand indices are valid
-        for instruction in &self.basic_blocks.iter().flat_map(|bb| &bb.instructions) {
+        for instruction in self.basic_blocks.iter().flat_map(|bb| &bb.instructions) {
             self.validate_instruction_operands(instruction)?;
         }
 
@@ -539,22 +543,22 @@ impl WasmIR {
             }
             Instruction::Call { args, .. } => {
                 for (i, arg) in args.iter().enumerate() {
-                    self.validate_operand(arg, format!("arg_{}", i))?;
+                    self.validate_operand(arg, "arg")?;
                 }
             }
             Instruction::MemoryLoad { address, .. } => {
-                self.validate_operand(address, "address".to_string())?;
+                self.validate_operand(address, "address")?;
             }
             Instruction::MemoryStore { address, value, .. } => {
-                self.validate_operand(address, "address".to_string())?;
-                self.validate_operand(value, "value".to_string())?;
+                self.validate_operand(address, "address")?;
+                self.validate_operand(value, "value")?;
             }
             Instruction::Branch { condition, .. } => {
-                self.validate_operand(condition, "condition".to_string())?;
+                self.validate_operand(condition, "condition")?;
             }
             Instruction::JSMethodCall { args, .. } => {
                 for (i, arg) in args.iter().enumerate() {
-                    self.validate_operand(arg, format!("js_arg_{}", i))?;
+                    self.validate_operand(arg, "js_arg")?;
                 }
             }
             _ => {
@@ -565,7 +569,7 @@ impl WasmIR {
     }
 
     /// Validates an operand
-    fn validate_operand(&self, operand: &Operand, context: String) -> Result<(), ValidationError> {
+    fn validate_operand(&self, operand: &Operand, context: &str) -> Result<(), ValidationError> {
         match operand {
             Operand::Local(index) => {
                 if *index >= self.locals.len() as u32 {
@@ -578,7 +582,7 @@ impl WasmIR {
             Operand::ExternRef(_) => {} // ExternRefs are checked at link time
             Operand::FuncRef(_) => {} // FuncRefs are checked at link time
             Operand::MemoryAddress(addr) => {
-                self.validate_operand(addr, format!("address_{}", context))?;
+                self.validate_operand(addr, "address")?;
             }
             Operand::StackValue(_) => {} // Stack values are checked during compilation
         }
@@ -606,16 +610,16 @@ impl WasmIR {
     }
 
     /// Finds all local variables that are used
-    pub fn used_locals(&self) -> std::collections::HashSet<u32> {
-        let mut used_locals = std::collections::HashSet::new();
+    pub fn used_locals(&self) -> HashMap<u32, ()> {
+        let mut used_locals = HashMap::new();
         
         for instruction in self.all_instructions() {
             match instruction {
                 Instruction::LocalGet { index } => {
-                    used_locals.insert(*index);
+                    used_locals.insert(*index, ());
                 }
                 Instruction::LocalSet { index, .. } => {
-                    used_locals.insert(*index);
+                    used_locals.insert(*index, ());
                 }
                 Instruction::BinaryOp { left, right, .. } => {
                     self.collect_used_locals_from_operand(left, &mut used_locals);
@@ -637,10 +641,10 @@ impl WasmIR {
     }
 
     /// Collects local variables used in an operand
-    fn collect_used_locals_from_operand(&self, operand: &Operand, used_locals: &mut std::collections::HashSet<u32>) {
+    fn collect_used_locals_from_operand(&self, operand: &Operand, used_locals: &mut HashMap<u32, ()>) {
         match operand {
             Operand::Local(index) => {
-                used_locals.insert(*index);
+                used_locals.insert(*index, ());
             }
             Operand::MemoryAddress(addr) => {
                 self.collect_used_locals_from_operand(addr, used_locals);
@@ -651,7 +655,7 @@ impl WasmIR {
 }
 
 /// Validation errors for WasmIR
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ValidationError {
     /// Invalid local variable index
     InvalidLocalIndex(u32),
@@ -686,7 +690,6 @@ impl fmt::Display for ValidationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
 
     #[test]
     fn test_simple_function_creation() {
@@ -839,7 +842,7 @@ mod tests {
         
         let local1 = func.add_local(Type::I32);
         let local2 = func.add_local(Type::I32);
-        let _local3 = func.add_local(Type::I32);
+        let local3 = func.add_local(Type::I32);
         
         let instructions = vec![
             Instruction::LocalGet { index: local1 },
@@ -854,8 +857,8 @@ mod tests {
         func.add_basic_block(instructions, Terminator::Return { value: None });
         
         let used_locals = func.used_locals();
-        assert!(used_locals.contains(&local1));
-        assert!(used_locals.contains(&local2));
-        assert!(!used_locals.contains(&local3)); // local3 is never used
+        assert!(used_locals.contains_key(&local1));
+        assert!(used_locals.contains_key(&local2));
+        assert!(!used_locals.contains_key(&local3)); // local3 is never used
     }
 }

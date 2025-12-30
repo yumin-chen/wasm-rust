@@ -25,6 +25,7 @@ pub mod host;
 pub mod memory;
 pub mod threading;
 pub mod component;
+pub mod wasmir;
 
 use host::{HostProfile, HostCapabilities, get_host_capabilities};
 
